@@ -157,6 +157,65 @@ cargo run -- --mode live --refresh --connect i-0123456789abcdef0 --terminal pwsh
 cargo run -- --mode live --port-forward i-0123456789abcdef0 --local-port 15432 --remote-port 5432 --terminal pwsh
 ```
 
+## Windows VM test on Linux via Docker Compose
+
+When you want to smoke-test Windows artifacts from a Linux workstation, use:
+
+```bash
+docker compose -f docker-compose.windows-test.yml up -d
+```
+
+Notes:
+- This uses `dockurr/windows` (Windows VM in a container), not native Windows containers.
+- Requires hardware virtualization support (`/dev/kvm`) and Docker privileges.
+- Windows build artifacts are mounted read-only from `./dist/windows` into the container path `/shared/dist/windows`.
+- Exposed ports:
+  - `8006` web viewer
+  - `3389` RDP
+
+Validate compose config quickly:
+
+```bash
+./scripts/test_windows_compose.sh
+```
+
+One-command helper to build, run terminal-specific GUI validation tests, start the VM, and verify:
+
+```bash
+./scripts/run_windows_vm_test.sh
+```
+
+Skip terminal-specific GUI validation tests if needed:
+
+```bash
+./scripts/run_windows_vm_test.sh --skip-gui-terminal-tests
+```
+
+Helper script tests:
+
+```bash
+./scripts/test_run_windows_vm_test.sh
+```
+
+Automated Windows in-guest GUI terminal smoke test (MSYS2 terminal only; uses `/oem/install.bat` hook and shared result marker):
+
+```bash
+./scripts/run_windows_gui_smoke_test.sh
+```
+
+If MSYS2 is installed in a non-default location, override detection path:
+
+```bash
+./scripts/run_windows_gui_smoke_test.sh --msys2-bash-path 'C:\custom\msys64\usr\bin\bash.exe'
+```
+
+Related smoke harness checks:
+
+```bash
+./scripts/test_windows_gui_smoke_compose.sh
+./scripts/test_run_windows_gui_smoke_test.sh
+```
+
 ## Useful options
 
 - `--interactive`

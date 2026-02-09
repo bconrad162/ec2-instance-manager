@@ -1,0 +1,26 @@
+services:
+  windows-gui-smoke:
+    image: dockurr/windows:latest
+    container_name: ec2-manager-windows-gui-smoke
+    privileged: true
+    devices:
+      - /dev/kvm
+    environment:
+      VERSION: "11"
+      RAM_SIZE: "8G"
+      CPU_CORES: "4"
+      DISK_SIZE: "64G"
+      USERNAME: "ec2manager"
+      PASSWORD: "ec2manager"
+    ports:
+      - "8016:8006"
+      - "3390:3389/tcp"
+      - "3390:3389/udp"
+    volumes:
+      - windows-gui-smoke-storage:/storage
+      - ./windows-vm/smoke/share:/shared
+      - ./windows-vm/smoke/oem:/oem:ro
+    restart: unless-stopped
+
+volumes:
+  windows-gui-smoke-storage:

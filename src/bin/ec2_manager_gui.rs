@@ -12,14 +12,21 @@ mod gui {
     use std::collections::{HashMap, VecDeque};
     use std::fs;
     use std::io::{Read, Write};
+    #[cfg(target_os = "windows")]
+    use std::io::BufReader;
+    #[cfg(target_os = "windows")]
+    use std::os::windows::process::CommandExt;
+    use std::panic::{self, AssertUnwindSafe};
     use std::path::PathBuf;
-    #[cfg(test)]
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, ChildStdin};
+    #[cfg(any(target_os = "windows", test))]
+    use std::process::{Command, Stdio};
     use std::sync::mpsc::{self, Receiver, Sender};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, Once};
     use std::time::{Duration, Instant, SystemTime};
 
     use eframe::egui;
+    #[cfg(not(target_os = "windows"))]
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
     use ec2_manager::aws_context::build_context;
@@ -49,6 +56,12 @@ mod gui {
     const PROFILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
     const PROFILE_CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
     const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(450);
+    const GUI_SMOKE_MARKER_ENV: &str = "EC2_MANAGER_GUI_SMOKE_MARKER";
+    const GUI_SMOKE_EXPECTED_TEXT_ENV: &str = "EC2_MANAGER_GUI_SMOKE_EXPECTED_TEXT";
+    const GUI_SMOKE_EXIT_ON_MARKER_ENV: &str = "EC2_MANAGER_GUI_SMOKE_EXIT_ON_MARKER";
+    const GUI_SMOKE_AUTO_CONNECT_ENV: &str = "EC2_MANAGER_GUI_SMOKE_AUTO_CONNECT";
+    #[cfg(target_os = "windows")]
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
 
     const COL_FAV_W: f32 = 44.0;
     const COL_INSTANCE_W: f32 = 150.0;
@@ -62,6 +75,36 @@ mod gui {
     const STATE_FILTER_RUNNING: &str = "running";
     const STATE_FILTER_STOPPED: &str = "stopped";
     const STATE_FILTER_TERMINATED: &str = "terminated";
+    const AWS_REGION_AUTO: &str = "(auto)";
+    const AWS_REGIONS: &[&str] = &[
+        "us-east-1",
+        "us-east-2",
+        "us-west-1",
+        "us-west-2",
+        "ca-central-1",
+        "sa-east-1",
+        "eu-west-1",
+        "eu-west-2",
+        "eu-west-3",
+        "eu-central-1",
+        "eu-central-2",
+        "eu-north-1",
+        "eu-south-1",
+        "eu-south-2",
+        "me-south-1",
+        "me-central-1",
+        "af-south-1",
+        "ap-south-1",
+        "ap-south-2",
+        "ap-east-1",
+        "ap-southeast-1",
+        "ap-southeast-2",
+        "ap-southeast-3",
+        "ap-southeast-4",
+        "ap-northeast-1",
+        "ap-northeast-2",
+        "ap-northeast-3",
+    ];
 
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum MainTab {
@@ -104,6 +147,14 @@ mod gui {
         info: bool,
         debug: bool,
         trace: bool,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct GuiSmokeConfig {
+        marker_path: PathBuf,
+        expected_text: String,
+        exit_on_marker: bool,
+        auto_connect: bool,
     }
 
     impl Default for LogFilters {
@@ -164,6 +215,11 @@ mod gui {
         child: Box<dyn portable_pty::Child + Send>,
         writer: Arc<Mutex<Box<dyn Write + Send>>>,
         parser: vt100::Parser,
+    }
+
+    struct PipeSession {
+        child: Child,
+        stdin: Arc<Mutex<ChildStdin>>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -255,7 +311,62 @@ mod gui {
         }
     }
 
+    fn selected_region_label(selected_region: Option<&str>, context_region: Option<&str>) -> String {
+        if let Some(region) = selected_region {
+            return region.to_string();
+        }
+        match context_region {
+            Some(region) => format!("{AWS_REGION_AUTO} ({region})"),
+            None => AWS_REGION_AUTO.to_string(),
+        }
+    }
+
+    fn panic_log_path() -> PathBuf {
+        AppConfig::config_path()
+            .map(|p| p.with_file_name("ec2_manager_gui_panic.log"))
+            .unwrap_or_else(|| std::env::temp_dir().join("ec2_manager_gui_panic.log"))
+    }
+
+    fn panic_payload_to_string(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(message) = payload.downcast_ref::<&'static str>() {
+            return (*message).to_string();
+        }
+        if let Some(message) = payload.downcast_ref::<String>() {
+            return message.clone();
+        }
+        "non-string panic payload".to_string()
+    }
+
+    fn append_panic_log_entry(entry: &str) {
+        let path = panic_log_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(file, "{entry}");
+        }
+    }
+
+    fn install_gui_panic_hook() {
+        static PANIC_HOOK_ONCE: Once = Once::new();
+        PANIC_HOOK_ONCE.call_once(|| {
+            let default_hook = panic::take_hook();
+            panic::set_hook(Box::new(move |info| {
+                let location = info
+                    .location()
+                    .map(|loc| format!("{}:{}", loc.file(), loc.line()))
+                    .unwrap_or_else(|| "unknown-location".to_string());
+                let payload = panic_payload_to_string(info.payload());
+                let message = format!("panic captured: {payload} @ {location}");
+                append_panic_log_entry(&message);
+                eprintln!("error: {message}");
+                default_hook(info);
+            }));
+        });
+    }
+
     pub fn run() {
+        install_gui_panic_hook();
         if std::env::args().any(|a| a == "--help" || a == "-h") {
             println!("{}", gui_help_text());
             return;
@@ -274,15 +385,31 @@ mod gui {
         let title = "EC2 + SSM Instance Explorer";
         let app_options = options.clone();
 
-        let result = eframe::run_native(
-            title,
-            native_options,
-            Box::new(move |_cc| Ok(Box::new(Ec2GuiApp::new(app_options.clone())))),
-        );
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            eframe::run_native(
+                title,
+                native_options,
+                Box::new(move |_cc| Ok(Box::new(Ec2GuiApp::new(app_options.clone())))),
+            )
+        }));
 
-        if let Err(err) = result {
-            eprintln!("error: failed to start GUI: {err}");
-            std::process::exit(1);
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                let message = format!("failed to start GUI: {err}");
+                append_panic_log_entry(&message);
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
+            Err(payload) => {
+                let message = format!(
+                    "GUI bootstrap panic: {}",
+                    panic_payload_to_string(payload.as_ref())
+                );
+                append_panic_log_entry(&message);
+                eprintln!("error: {message}");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -297,6 +424,10 @@ mod gui {
 
     struct Ec2GuiApp {
         options: GuiOptions,
+        gui_smoke: Option<GuiSmokeConfig>,
+        gui_smoke_marker_written: bool,
+        gui_smoke_auto_connect_attempted: bool,
+        gui_smoke_should_close: bool,
         config: AppConfig,
         context: Option<AwsContext>,
         dependencies: DependencyStatus,
@@ -327,6 +458,7 @@ mod gui {
         last_profile_poll_at: Instant,
         connections: ConnectionTabs,
         pty_sessions: HashMap<u64, PtySession>,
+        pipe_sessions: HashMap<u64, PipeSession>,
         proc_tx: Sender<ProcEvent>,
         proc_rx: Receiver<ProcEvent>,
     }
@@ -342,9 +474,14 @@ mod gui {
             let last_profile_choice_mtime = profile_choice_mtime(profile_choice_path.as_deref());
             let terminals = discover_terminals();
             let selected_terminal_id = initial_terminal_id(&config, &terminals);
+            let gui_smoke = gui_smoke_config_from_env();
 
             let mut app = Self {
                 options,
+                gui_smoke,
+                gui_smoke_marker_written: false,
+                gui_smoke_auto_connect_attempted: false,
+                gui_smoke_should_close: false,
                 config,
                 context: None,
                 dependencies,
@@ -375,12 +512,24 @@ mod gui {
                 last_profile_poll_at: Instant::now(),
                 connections: ConnectionTabs::new(),
                 pty_sessions: HashMap::new(),
+                pipe_sessions: HashMap::new(),
                 proc_tx,
                 proc_rx,
             };
 
             app.log_info("application started");
-            let _ = app.refresh_context_and_inventory(true);
+            if let Some(smoke) = &app.gui_smoke {
+                app.log_info(format!(
+                    "GUI smoke mode enabled marker={} expected='{}'",
+                    smoke.marker_path.display(),
+                    smoke.expected_text
+                ));
+            }
+            if let Err(err) = app.refresh_context_and_inventory(true) {
+                app.message = format!("error: {err}");
+                app.log_error(app.message.clone());
+            }
+            app.maybe_auto_connect_gui_smoke();
             app
         }
 
@@ -497,6 +646,7 @@ mod gui {
                 self.filtered.len()
             );
             self.log_info(self.message.clone());
+            self.maybe_auto_connect_gui_smoke();
             Ok(())
         }
 
@@ -516,6 +666,76 @@ mod gui {
                 self.filtered.len(),
                 self.inventory.instances.len()
             ));
+        }
+
+        fn maybe_auto_connect_gui_smoke(&mut self) {
+            if self.gui_smoke_auto_connect_attempted {
+                return;
+            }
+            let Some(smoke) = &self.gui_smoke else {
+                return;
+            };
+            if !smoke.auto_connect {
+                self.gui_smoke_auto_connect_attempted = true;
+                return;
+            }
+            self.gui_smoke_auto_connect_attempted = true;
+
+            if self.options.mode != Mode::Sim {
+                self.log_warn("GUI smoke auto-connect only runs in sim mode");
+                return;
+            }
+
+            let Some(instance_id) = self
+                .filtered
+                .iter()
+                .find(|i| i.ssm_managed)
+                .or_else(|| self.filtered.first())
+                .map(|i| i.instance_id.clone())
+            else {
+                self.log_error("GUI smoke auto-connect failed: no instances available");
+                return;
+            };
+
+            self.selected_instance_id = instance_id;
+            match self.connect_selected() {
+                Ok(()) => self.log_info("GUI smoke auto-connect succeeded"),
+                Err(err) => self.log_error(format!("GUI smoke auto-connect failed: {err}")),
+            }
+        }
+
+        fn maybe_record_gui_smoke_success(&mut self, tab_id: u64, bytes: &[u8]) {
+            let Some(smoke) = &self.gui_smoke else {
+                return;
+            };
+            let marker_path = smoke.marker_path.clone();
+            let expected_text = smoke.expected_text.clone();
+            let exit_on_marker = smoke.exit_on_marker;
+            if self.gui_smoke_marker_written {
+                return;
+            }
+            if !gui_smoke_match_in_bytes(&expected_text, bytes) {
+                return;
+            }
+
+            match write_gui_smoke_marker(&marker_path, tab_id, &expected_text) {
+                Ok(()) => {
+                    self.gui_smoke_marker_written = true;
+                    self.log_info(format!(
+                        "GUI smoke marker written to {}",
+                        marker_path.display()
+                    ));
+                    if exit_on_marker {
+                        self.gui_smoke_should_close = true;
+                    }
+                }
+                Err(err) => {
+                    self.log_error(format!(
+                        "failed to write GUI smoke marker {}: {err}",
+                        marker_path.display()
+                    ));
+                }
+            }
         }
 
         fn account_scope(&self) -> String {
@@ -694,6 +914,9 @@ mod gui {
                 return Ok(());
             }
 
+            #[cfg(target_os = "windows")]
+            self.spawn_pipe_session(tab_id, selected_terminal.as_ref(), context)?;
+            #[cfg(not(target_os = "windows"))]
             self.spawn_pty_session(tab_id, selected_terminal.as_ref(), context)?;
             if should_auto_send_prefilled_command(self.options.dry_run) {
                 let mut payload = command.into_bytes();
@@ -718,6 +941,97 @@ mod gui {
             Ok(())
         }
 
+        #[cfg(target_os = "windows")]
+        fn spawn_pipe_session(
+            &mut self,
+            tab_id: u64,
+            terminal: Option<&TerminalOption>,
+            context: &AwsContext,
+        ) -> Result<()> {
+            let (program, args) = shell_plan(terminal);
+            self.log_debug(format!("spawning pipe shell via {program}"));
+
+            let mut command = Command::new(program);
+            command
+                .args(args)
+                .env("AWS_PROFILE", &context.profile)
+                .env("AWS_REGION", &context.region)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::piped())
+                .creation_flags(CREATE_NO_WINDOW);
+            let mut child = command
+                .spawn()
+                .map_err(|err| AppError::Parse(format!("Failed to start shell: {err}")))?;
+
+            if let Some(stdout) = child.stdout.take() {
+                let tx = self.proc_tx.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stdout);
+                    let mut buf = vec![0_u8; 8192];
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let _ = tx.send(ProcEvent::Output {
+                                    tab_id,
+                                    bytes: buf[..n].to_vec(),
+                                });
+                            }
+                            Err(err) => {
+                                let _ = tx.send(ProcEvent::Error {
+                                    tab_id,
+                                    error: err.to_string(),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+
+            if let Some(stderr) = child.stderr.take() {
+                let tx = self.proc_tx.clone();
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stderr);
+                    let mut buf = vec![0_u8; 8192];
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let _ = tx.send(ProcEvent::Output {
+                                    tab_id,
+                                    bytes: buf[..n].to_vec(),
+                                });
+                            }
+                            Err(err) => {
+                                let _ = tx.send(ProcEvent::Error {
+                                    tab_id,
+                                    error: err.to_string(),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| AppError::Parse("Failed to acquire child stdin".to_string()))?;
+
+            self.pipe_sessions.insert(
+                tab_id,
+                PipeSession {
+                    child,
+                    stdin: Arc::new(Mutex::new(stdin)),
+                },
+            );
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "windows"))]
         fn spawn_pty_session(
             &mut self,
             tab_id: u64,
@@ -800,7 +1114,13 @@ mod gui {
                         self.log(LogLevel::Trace, format!("tab={tab_id} output bytes={}", bytes.len()));
                         if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
                             session.parser.process(&bytes);
+                        } else {
+                            let text = String::from_utf8_lossy(&bytes).to_string();
+                            for line in text.lines() {
+                                self.connections.append_line(tab_id, line.to_string());
+                            }
                         }
+                        self.maybe_record_gui_smoke_success(tab_id, &bytes);
                     }
                     ProcEvent::Error { tab_id, error } => {
                         self.log_error(format!("tab={tab_id} process error: {error}"));
@@ -816,12 +1136,26 @@ mod gui {
                 }
             }
 
-            let mut exited = Vec::new();
+            let mut exited: Vec<(u64, i32)> = Vec::new();
             let mut wait_errors: Vec<String> = Vec::new();
             for (tab_id, session) in &mut self.pty_sessions {
                 match session.child.try_wait() {
                     Ok(Some(status)) => {
                         exited.push((*tab_id, status.exit_code() as i32));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        wait_errors.push(format!("tab={tab_id} wait error: {err}"));
+                        self.connections
+                            .append_line(*tab_id, format!("[wait error] {err}"));
+                        exited.push((*tab_id, -1));
+                    }
+                }
+            }
+            for (tab_id, session) in &mut self.pipe_sessions {
+                match session.child.try_wait() {
+                    Ok(Some(status)) => {
+                        exited.push((*tab_id, status.code().unwrap_or(-1)));
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -838,6 +1172,7 @@ mod gui {
 
             for (tab_id, code) in exited {
                 self.pty_sessions.remove(&tab_id);
+                self.pipe_sessions.remove(&tab_id);
                 let _ = self.proc_tx.send(ProcEvent::Exited { tab_id, code });
             }
         }
@@ -847,18 +1182,39 @@ mod gui {
                 let _ = session.child.kill();
                 let _ = session.child.wait();
             }
+            if let Some(mut session) = self.pipe_sessions.remove(&tab_id) {
+                let _ = session.child.kill();
+                let _ = session.child.wait();
+            }
             self.connections.close(tab_id);
             self.log_info(format!("closed connection tab id={tab_id}"));
         }
 
         fn send_raw_bytes_to_connection_tab(&mut self, tab_id: u64, payload: &[u8]) {
+            let mut write_error: Option<String> = None;
             let Some(session) = self.pty_sessions.get(&tab_id) else {
+                if let Some(pipe) = self.pipe_sessions.get(&tab_id) {
+                    if let Ok(mut stdin) = pipe.stdin.lock() {
+                        if let Err(err) = stdin.write_all(payload) {
+                            write_error = Some(format!("tab={tab_id} write error: {err}"));
+                        }
+                    }
+                }
+                if let Some(message) = write_error {
+                    self.log_error(message);
+                }
                 return;
             };
             let Ok(mut stdin) = session.writer.lock() else {
                 return;
             };
-            let _ = stdin.write_all(payload);
+            if let Err(err) = stdin.write_all(payload) {
+                write_error = Some(format!("tab={tab_id} write error: {err}"));
+            }
+            drop(stdin);
+            if let Some(message) = write_error {
+                self.log_error(message);
+            }
         }
 
         fn forward_terminal_key_input(&mut self, ctx: &egui::Context, tab_id: u64) {
@@ -1163,7 +1519,10 @@ mod gui {
 
                         if let Some(instance_id) = pending_connect {
                             self.selected_instance_id = instance_id;
-                            let _ = self.connect_selected();
+                            if let Err(err) = self.connect_selected() {
+                                self.message = format!("error: {err}");
+                                self.log_error(self.message.clone());
+                            }
                             self.main_tab = MainTab::Connections;
                         }
                     });
@@ -1243,8 +1602,16 @@ mod gui {
                             .sense(egui::Sense::click()),
                     )
                 });
-                let terminal_clicked = terminal_response.inner.clicked();
-                if terminal_clicked || tab.running {
+                let terminal_focus_id = ui.make_persistent_id(("terminal_focus", tab.id));
+                let terminal_focus_response = ui.interact(
+                    terminal_response.inner.rect,
+                    terminal_focus_id,
+                    egui::Sense::click(),
+                );
+                if terminal_focus_response.clicked() {
+                    terminal_focus_response.request_focus();
+                }
+                if terminal_focus_response.has_focus() {
                     self.forward_terminal_key_input(ui.ctx(), tab.id);
                 }
             }
@@ -1315,63 +1682,103 @@ mod gui {
 
     impl eframe::App for Ec2GuiApp {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-            self.poll_profile_choice_changes();
-            self.poll_connection_events();
-            if self.main_tab == MainTab::Connections && !self.pty_sessions.is_empty() {
-                ctx.request_repaint_after(CURSOR_BLINK_INTERVAL);
-            }
-
-            egui::TopBottomPanel::top("top").show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.heading("EC2 + SSM Instance Explorer");
-                    ui.separator();
-                    ui.label(format!("Mode: {}", self.options.mode.as_str()));
-                    if let Some(c) = &self.context {
-                        ui.label(format!("Profile: {}", c.profile));
-                        ui.label(format!(
-                            "Account: {}",
-                            c.account_id.as_deref().unwrap_or("unknown")
-                        ));
-                        ui.label(format!("Region: {}", c.region));
-                        ui.label(format!("Auth: {}", c.auth_status));
-                    }
-                });
-
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(self.main_tab == MainTab::Inventory, "Inventory")
-                        .clicked()
-                    {
-                        self.main_tab = MainTab::Inventory;
-                    }
-                    if ui
-                        .selectable_label(
-                            self.main_tab == MainTab::Connections,
-                            format!("Connections ({})", self.connections.tabs().len()),
-                        )
-                        .clicked()
-                    {
-                        self.main_tab = MainTab::Connections;
-                    }
-                    if ui
-                        .selectable_label(self.main_tab == MainTab::Log, "Log")
-                        .clicked()
-                    {
-                        self.main_tab = MainTab::Log;
-                    }
-                });
-
-                if !self.message.is_empty() {
-                    ui.label(self.message.clone());
+            let update_result = panic::catch_unwind(AssertUnwindSafe(|| {
+                self.poll_profile_choice_changes();
+                self.poll_connection_events();
+                if self.main_tab == MainTab::Connections && !self.pty_sessions.is_empty() {
+                    ctx.request_repaint_after(CURSOR_BLINK_INTERVAL);
                 }
-            });
+                if self.gui_smoke_should_close {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
+                }
 
-            egui::SidePanel::left("controls")
-                .resizable(true)
-                .show(ctx, |ui| {
+                egui::TopBottomPanel::top("top").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("EC2 + SSM Instance Explorer");
+                        ui.separator();
+                        ui.label(format!("Mode: {}", self.options.mode.as_str()));
+                        if let Some(c) = &self.context {
+                            ui.label(format!("Profile: {}", c.profile));
+                            ui.label(format!(
+                                "Account: {}",
+                                c.account_id.as_deref().unwrap_or("unknown")
+                            ));
+                            ui.label(format!("Region: {}", c.region));
+                            ui.label(format!("Auth: {}", c.auth_status));
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .selectable_label(self.main_tab == MainTab::Inventory, "Inventory")
+                            .clicked()
+                        {
+                            self.main_tab = MainTab::Inventory;
+                        }
+                        if ui
+                            .selectable_label(
+                                self.main_tab == MainTab::Connections,
+                                format!("Connections ({})", self.connections.tabs().len()),
+                            )
+                            .clicked()
+                        {
+                            self.main_tab = MainTab::Connections;
+                        }
+                        if ui
+                            .selectable_label(self.main_tab == MainTab::Log, "Log")
+                            .clicked()
+                        {
+                            self.main_tab = MainTab::Log;
+                        }
+                    });
+
+                    if !self.message.is_empty() {
+                        ui.label(self.message.clone());
+                    }
+                });
+
+                egui::SidePanel::left("controls")
+                    .resizable(true)
+                    .show(ctx, |ui| {
                     ui.heading("Controls");
 
                     if ui.button("Refresh Inventory").clicked() {
+                        if let Err(err) = self.refresh_context_and_inventory(true) {
+                            self.message = format!("error: {err}");
+                            self.log_error(self.message.clone());
+                        }
+                    }
+                    let before_region = self.options.region.clone();
+                    let context_region = self.context.as_ref().map(|c| c.region.as_str());
+                    let selected_region_text =
+                        selected_region_label(self.options.region.as_deref(), context_region);
+                    egui::ComboBox::from_id_salt("region_selector_combo")
+                        .selected_text(selected_region_text)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.options.region, None, AWS_REGION_AUTO);
+                            for region in AWS_REGIONS {
+                                ui.selectable_value(
+                                    &mut self.options.region,
+                                    Some((*region).to_string()),
+                                    *region,
+                                );
+                            }
+                        });
+                    if self.options.region != before_region {
+                        self.config.default_region = self.options.region.clone();
+                        if let Err(err) = self.config.save() {
+                            self.message = format!("error: {err}");
+                            self.log_error(self.message.clone());
+                        } else {
+                            self.log_info(format!(
+                                "region selection changed to {}",
+                                self.options
+                                    .region
+                                    .clone()
+                                    .unwrap_or_else(|| AWS_REGION_AUTO.to_string())
+                            ));
+                        }
                         if let Err(err) = self.refresh_context_and_inventory(true) {
                             self.message = format!("error: {err}");
                             self.log_error(self.message.clone());
@@ -1614,13 +2021,25 @@ mod gui {
                         self.dependencies.ssm_plugin_found,
                         self.terminals.len()
                     ));
-                });
+                    });
 
-            egui::CentralPanel::default().show(ctx, |ui| match self.main_tab {
-                MainTab::Inventory => self.render_inventory_panel(ui),
-                MainTab::Connections => self.render_connections_panel(ui),
-                MainTab::Log => self.render_log_panel(ui),
-            });
+                egui::CentralPanel::default().show(ctx, |ui| match self.main_tab {
+                    MainTab::Inventory => self.render_inventory_panel(ui),
+                    MainTab::Connections => self.render_connections_panel(ui),
+                    MainTab::Log => self.render_log_panel(ui),
+                });
+            }));
+
+            if let Err(payload) = update_result {
+                let panic_message = format!(
+                    "UI panic recovered: {}",
+                    panic_payload_to_string(payload.as_ref())
+                );
+                append_panic_log_entry(&panic_message);
+                self.message = panic_message.clone();
+                self.log_error(panic_message);
+                self.main_tab = MainTab::Log;
+            }
         }
     }
 
@@ -1703,6 +2122,64 @@ mod gui {
         }
     }
 
+    fn parse_bool_env(raw: Option<&str>, default: bool) -> bool {
+        let Some(value) = raw else {
+            return default;
+        };
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" => default,
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        }
+    }
+
+    fn gui_smoke_config_from_env() -> Option<GuiSmokeConfig> {
+        let marker_path = std::env::var_os(GUI_SMOKE_MARKER_ENV)
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())?;
+
+        let expected_text = std::env::var(GUI_SMOKE_EXPECTED_TEXT_ENV)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "[SIM MODE] session open for".to_string());
+
+        let exit_on_marker = parse_bool_env(
+            std::env::var(GUI_SMOKE_EXIT_ON_MARKER_ENV).ok().as_deref(),
+            false,
+        );
+        let auto_connect = parse_bool_env(
+            std::env::var(GUI_SMOKE_AUTO_CONNECT_ENV).ok().as_deref(),
+            true,
+        );
+
+        Some(GuiSmokeConfig {
+            marker_path,
+            expected_text,
+            exit_on_marker,
+            auto_connect,
+        })
+    }
+
+    fn gui_smoke_match_in_bytes(expected_text: &str, bytes: &[u8]) -> bool {
+        if expected_text.trim().is_empty() {
+            return false;
+        }
+        String::from_utf8_lossy(bytes).contains(expected_text)
+    }
+
+    fn gui_smoke_marker_payload(tab_id: u64, expected_text: &str) -> String {
+        format!("PASS\ntab_id={tab_id}\nexpected={expected_text}\n")
+    }
+
+    fn write_gui_smoke_marker(path: &std::path::Path, tab_id: u64, expected_text: &str) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, gui_smoke_marker_payload(tab_id, expected_text))
+    }
+
     fn format_connection_summary_line(
         title: &str,
         instance_id: &str,
@@ -1775,9 +2252,60 @@ mod gui {
                 egui::Key::C if modifiers.ctrl => Some(vec![0x03]),
                 egui::Key::D if modifiers.ctrl => Some(vec![0x04]),
                 egui::Key::L if modifiers.ctrl => Some(vec![0x0c]),
+                _ if !modifiers.ctrl && !modifiers.command && !modifiers.alt => {
+                    key_ascii_fallback(*key, modifiers.shift).map(|c| vec![c])
+                }
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    fn key_ascii_fallback(key: egui::Key, shift: bool) -> Option<u8> {
+        let letter = match key {
+            egui::Key::A => Some(b'a'),
+            egui::Key::B => Some(b'b'),
+            egui::Key::C => Some(b'c'),
+            egui::Key::D => Some(b'd'),
+            egui::Key::E => Some(b'e'),
+            egui::Key::F => Some(b'f'),
+            egui::Key::G => Some(b'g'),
+            egui::Key::H => Some(b'h'),
+            egui::Key::I => Some(b'i'),
+            egui::Key::J => Some(b'j'),
+            egui::Key::K => Some(b'k'),
+            egui::Key::L => Some(b'l'),
+            egui::Key::M => Some(b'm'),
+            egui::Key::N => Some(b'n'),
+            egui::Key::O => Some(b'o'),
+            egui::Key::P => Some(b'p'),
+            egui::Key::Q => Some(b'q'),
+            egui::Key::R => Some(b'r'),
+            egui::Key::S => Some(b's'),
+            egui::Key::T => Some(b't'),
+            egui::Key::U => Some(b'u'),
+            egui::Key::V => Some(b'v'),
+            egui::Key::W => Some(b'w'),
+            egui::Key::X => Some(b'x'),
+            egui::Key::Y => Some(b'y'),
+            egui::Key::Z => Some(b'z'),
+            egui::Key::Num0 => Some(b'0'),
+            egui::Key::Num1 => Some(b'1'),
+            egui::Key::Num2 => Some(b'2'),
+            egui::Key::Num3 => Some(b'3'),
+            egui::Key::Num4 => Some(b'4'),
+            egui::Key::Num5 => Some(b'5'),
+            egui::Key::Num6 => Some(b'6'),
+            egui::Key::Num7 => Some(b'7'),
+            egui::Key::Num8 => Some(b'8'),
+            egui::Key::Num9 => Some(b'9'),
+            egui::Key::Space => Some(b' '),
+            _ => None,
+        }?;
+        if shift && letter.is_ascii_lowercase() {
+            Some(letter.to_ascii_uppercase())
+        } else {
+            Some(letter)
         }
     }
 
@@ -2137,9 +2665,82 @@ mod gui {
         }
 
         #[test]
+        fn selected_region_label_prefers_selected_region() {
+            assert_eq!(
+                selected_region_label(Some("eu-central-1"), Some("us-east-1")),
+                "eu-central-1".to_string()
+            );
+        }
+
+        #[test]
+        fn selected_region_label_displays_auto_with_context_region() {
+            assert_eq!(
+                selected_region_label(None, Some("us-west-2")),
+                "(auto) (us-west-2)".to_string()
+            );
+            assert_eq!(selected_region_label(None, None), "(auto)".to_string());
+        }
+
+        #[test]
         fn auto_send_prefilled_command_is_disabled_for_dry_run_only() {
             assert!(!should_auto_send_prefilled_command(true));
             assert!(should_auto_send_prefilled_command(false));
+        }
+
+        #[test]
+        fn parse_bool_env_understands_common_values() {
+            assert!(parse_bool_env(Some("true"), false));
+            assert!(parse_bool_env(Some("1"), false));
+            assert!(parse_bool_env(Some("YES"), false));
+            assert!(!parse_bool_env(Some("false"), true));
+            assert!(!parse_bool_env(Some("0"), true));
+            assert!(!parse_bool_env(Some("off"), true));
+            assert!(parse_bool_env(Some("unknown"), true));
+            assert!(!parse_bool_env(None, false));
+        }
+
+        #[test]
+        fn panic_payload_to_string_handles_string_and_static_str() {
+            let owned: Box<dyn std::any::Any + Send> = Box::new("owned panic".to_string());
+            assert_eq!(panic_payload_to_string(owned.as_ref()), "owned panic");
+
+            let static_str: Box<dyn std::any::Any + Send> = Box::new("static panic");
+            assert_eq!(panic_payload_to_string(static_str.as_ref()), "static panic");
+        }
+
+        #[test]
+        fn panic_log_path_uses_expected_file_name() {
+            let path = panic_log_path();
+            assert_eq!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("ec2_manager_gui_panic.log")
+            );
+        }
+
+        #[test]
+        fn gui_smoke_match_detects_expected_marker() {
+            assert!(gui_smoke_match_in_bytes(
+                "session open",
+                b"[SIM MODE] session open for i-sim0001"
+            ));
+            assert!(!gui_smoke_match_in_bytes("not-there", b"hello"));
+        }
+
+        #[test]
+        fn write_gui_smoke_marker_creates_parent_and_writes_payload() {
+            let base = std::env::temp_dir().join(format!(
+                "ec2-manager-gui-smoke-{}",
+                now_unix()
+            ));
+            let marker_path = base.join("nested").join("marker.txt");
+            write_gui_smoke_marker(&marker_path, 7, "session open")
+                .expect("marker write should succeed");
+            let content = fs::read_to_string(&marker_path).expect("marker should be readable");
+            assert!(content.contains("PASS"));
+            assert!(content.contains("tab_id=7"));
+            assert!(content.contains("expected=session open"));
+            let _ = fs::remove_file(&marker_path);
+            let _ = fs::remove_dir_all(&base);
         }
 
         #[test]
@@ -2170,6 +2771,30 @@ mod gui {
                 terminal_event_payload(&paste),
                 Some("echo hi".as_bytes().to_vec())
             );
+        }
+
+        #[test]
+        fn terminal_event_payload_falls_back_for_letter_keys() {
+            let key_a = egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            };
+            assert_eq!(terminal_event_payload(&key_a), Some(vec![b'a']));
+
+            let key_a_shift = egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            };
+            assert_eq!(terminal_event_payload(&key_a_shift), Some(vec![b'A']));
         }
 
         #[test]

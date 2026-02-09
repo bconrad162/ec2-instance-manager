@@ -1,0 +1,25 @@
+services:
+  windows-test:
+    image: dockurr/windows:latest
+    container_name: ec2-manager-windows-test
+    privileged: true
+    devices:
+      - /dev/kvm
+    environment:
+      VERSION: "11"
+      RAM_SIZE: "8G"
+      CPU_CORES: "4"
+      DISK_SIZE: "64G"
+      USERNAME: "ec2manager"
+      PASSWORD: "ec2manager"
+    ports:
+      - "8006:8006"
+      - "3389:3389/tcp"
+      - "3389:3389/udp"
+    volumes:
+      - windows-test-storage:/storage
+      - ./dist/windows:/shared/dist/windows:ro
+    restart: unless-stopped
+
+volumes:
+  windows-test-storage:
