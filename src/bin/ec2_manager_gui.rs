@@ -11,7 +11,7 @@ fn main() {
 mod gui {
     use std::collections::{HashMap, VecDeque};
     use std::fs;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc::{self, Receiver, Sender};
@@ -310,6 +310,7 @@ mod gui {
         log_filters: LogFilters,
         terminals: Vec<TerminalOption>,
         selected_terminal_id: String,
+        tab_input_by_id: HashMap<u64, String>,
         profile_choice_path: Option<PathBuf>,
         last_profile_choice_mtime: Option<SystemTime>,
         pending_profile_choice_mtime: Option<SystemTime>,
@@ -358,6 +359,7 @@ mod gui {
                 log_filters: LogFilters::default(),
                 terminals,
                 selected_terminal_id,
+                tab_input_by_id: HashMap::new(),
                 profile_choice_path,
                 last_profile_choice_mtime,
                 pending_profile_choice_mtime: None,
@@ -644,6 +646,7 @@ mod gui {
             command: String,
             context: &AwsContext,
         ) -> Result<()> {
+            let selected_terminal = self.selected_terminal().cloned();
             let tab_id = self.connections.open(title.clone(), instance_id.clone());
             self.log_info(format!(
                 "opened connection tab id={tab_id} instance={instance_id}"
@@ -659,6 +662,17 @@ mod gui {
                     context.mode.as_str()
                 ),
             );
+            if let Some(terminal) = &selected_terminal {
+                self.connections.append_line(
+                    tab_id,
+                    format!("[shell profile] {} ({})", terminal.display_name, terminal.id),
+                );
+            }
+            self.connections.append_line(
+                tab_id,
+                "SSM command is prefilled below. Edit and press Send when ready.".to_string(),
+            );
+            self.tab_input_by_id.insert(tab_id, command.clone());
 
             if context.mode == Mode::Live {
                 self.connections.append_line(
@@ -676,7 +690,7 @@ mod gui {
                 return Ok(());
             }
 
-            let (program, args) = shell_plan(&command);
+            let (program, args) = shell_plan(selected_terminal.as_ref());
             self.log_debug(format!("spawning shell command via {program}"));
             let mut child = Command::new(program)
                 .args(args)
@@ -684,7 +698,7 @@ mod gui {
                 .env("AWS_REGION", &context.region)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .stdin(Stdio::null())
+                .stdin(Stdio::piped())
                 .spawn()
                 .map_err(|err| {
                     AppError::Parse(format!("Failed to start embedded process: {err}"))
@@ -736,6 +750,10 @@ mod gui {
             }
 
             self.children.insert(tab_id, child);
+            if should_auto_send_prefilled_command(self.options.dry_run) {
+                self.send_to_connection_tab(tab_id, command.clone());
+                self.log_info(format!("tab={tab_id} auto-sent prefilled command"));
+            }
 
             if !self.options.dry_run {
                 self.config
@@ -805,7 +823,35 @@ mod gui {
                 terminate_child(&mut child);
             }
             self.connections.close(tab_id);
+            self.tab_input_by_id.remove(&tab_id);
             self.log_info(format!("closed connection tab id={tab_id}"));
+        }
+
+        fn send_to_connection_tab(&mut self, tab_id: u64, input: String) {
+            let trimmed = input.trim_end().to_string();
+            if trimmed.is_empty() {
+                return;
+            }
+            self.connections.append_line(tab_id, format!("> {trimmed}"));
+
+            let Some(child) = self.children.get_mut(&tab_id) else {
+                self.connections
+                    .append_line(tab_id, "[input] no running process".to_string());
+                return;
+            };
+
+            let Some(stdin) = child.stdin.as_mut() else {
+                self.connections
+                    .append_line(tab_id, "[input] process stdin unavailable".to_string());
+                return;
+            };
+
+            let mut payload = trimmed;
+            payload.push('\n');
+            if let Err(err) = stdin.write_all(payload.as_bytes()) {
+                self.connections
+                    .append_line(tab_id, format!("[input error] {err}"));
+            }
         }
 
         fn toggle_favorite_selected(&mut self) -> Result<()> {
@@ -1156,7 +1202,7 @@ mod gui {
 
             ui.separator();
 
-            if let Some(tab) = self.connections.selected_ref() {
+            if let Some(tab) = self.connections.selected_ref().cloned() {
                 let private_ip = find_instance(&self.inventory.instances, &tab.instance_id)
                     .and_then(|i| i.private_ip.clone())
                     .unwrap_or_else(|| "-".to_string());
@@ -1173,6 +1219,21 @@ mod gui {
                         ui.monospace(line);
                     }
                 });
+
+                ui.separator();
+                let mut send_clicked = false;
+                let entry = self.tab_input_by_id.entry(tab.id).or_default();
+                ui.horizontal(|ui| {
+                    ui.label("Input");
+                    let response = ui.text_edit_singleline(entry);
+                    let enter_pressed =
+                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    send_clicked = ui.button("Send").clicked() || enter_pressed;
+                });
+                if send_clicked {
+                    let current = self.tab_input_by_id.get(&tab.id).cloned().unwrap_or_default();
+                    self.send_to_connection_tab(tab.id, current);
+                }
             }
         }
 
@@ -1547,11 +1608,31 @@ mod gui {
         }
     }
 
-    fn shell_plan(command: &str) -> (&'static str, Vec<String>) {
+    fn shell_plan(terminal: Option<&TerminalOption>) -> (String, Vec<String>) {
         if cfg!(windows) {
-            ("cmd", vec!["/C".to_string(), command.to_string()])
+            match terminal.map(|t| t.id.as_str()) {
+                Some("pwsh") | Some("powershell") | Some("wt") => (
+                    terminal
+                        .map(|t| t.program.clone())
+                        .unwrap_or_else(|| "powershell".to_string()),
+                    Vec::new(),
+                ),
+                Some("git-bash") | Some("msys2-bash") => (
+                    terminal
+                        .map(|t| t.program.clone())
+                        .unwrap_or_else(|| "bash".to_string()),
+                    vec!["-i".to_string()],
+                ),
+                Some("wsl") => (
+                    terminal
+                        .map(|t| t.program.clone())
+                        .unwrap_or_else(|| "wsl".to_string()),
+                    vec!["--".to_string(), "bash".to_string(), "-i".to_string()],
+                ),
+                _ => ("cmd".to_string(), vec!["/Q".to_string(), "/K".to_string()]),
+            }
         } else {
-            ("/bin/bash", vec!["-lc".to_string(), command.to_string()])
+            ("/bin/bash".to_string(), vec!["-i".to_string()])
         }
     }
 
@@ -1617,6 +1698,10 @@ mod gui {
         )
     }
 
+    fn should_auto_send_prefilled_command(dry_run: bool) -> bool {
+        !dry_run
+    }
+
     fn initial_terminal_id(config: &AppConfig, terminals: &[TerminalOption]) -> String {
         pick_default_terminal(config, terminals)
             .or_else(|| terminals.first().cloned())
@@ -1638,7 +1723,7 @@ mod gui {
 
         #[test]
         fn shell_plan_has_program() {
-            let (prog, args) = shell_plan("echo hi");
+            let (prog, args) = shell_plan(None);
             assert!(!prog.is_empty());
             assert!(!args.is_empty());
         }
@@ -1715,6 +1800,8 @@ mod gui {
             .expect("dry-run open should succeed");
 
             assert!(app.children.is_empty());
+            let prefill = app.tab_input_by_id.values().next().cloned().unwrap_or_default();
+            assert_eq!(prefill, "echo hi");
             let selected = app
                 .connections
                 .selected_ref()
@@ -1903,6 +1990,12 @@ mod gui {
             assert!(line.contains("Private IP: 10.0.1.25"));
             assert!(line.contains("Status: Running"));
             assert!(line.contains('\t'));
+        }
+
+        #[test]
+        fn auto_send_prefilled_command_is_disabled_for_dry_run_only() {
+            assert!(!should_auto_send_prefilled_command(true));
+            assert!(should_auto_send_prefilled_command(false));
         }
     }
 }
