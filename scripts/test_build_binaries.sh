@@ -46,11 +46,64 @@ test_invalid_mode_fails() {
   fi
 }
 
+test_package_linux_zip_creates_archive_with_artifacts() {
+  if ! command -v zip >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
+    echo "skipping linux zip packaging test (zip/unzip not installed)"
+    return 0
+  fi
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  local original_linux_dist_dir="$LINUX_DIST_DIR"
+  LINUX_DIST_DIR="$tmpdir"
+
+  touch "$LINUX_DIST_DIR/$CLI_APP_NAME"
+  touch "$LINUX_DIST_DIR/$GUI_APP_NAME"
+
+  package_linux_zip
+
+  local zip_path="$LINUX_DIST_DIR/ec2_manager_linux.zip"
+  if [[ ! -f "$zip_path" ]]; then
+    echo "assertion failed: linux zip was not created" >&2
+    exit 1
+  fi
+
+  local listing
+  listing="$(unzip -Z1 "$zip_path" | tr '\n' ' ')"
+  if [[ "$listing" != *"$CLI_APP_NAME"* || "$listing" != *"$GUI_APP_NAME"* ]]; then
+    echo "assertion failed: linux zip missing expected artifacts" >&2
+    echo "  listing: $listing" >&2
+    exit 1
+  fi
+
+  rm -rf "$tmpdir"
+  LINUX_DIST_DIR="$original_linux_dist_dir"
+}
+
+test_package_linux_zip_skips_when_no_artifacts() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  local original_linux_dist_dir="$LINUX_DIST_DIR"
+  LINUX_DIST_DIR="$tmpdir"
+
+  package_linux_zip
+
+  if [[ -f "$LINUX_DIST_DIR/ec2_manager_linux.zip" ]]; then
+    echo "assertion failed: linux zip should not be created without artifacts" >&2
+    exit 1
+  fi
+
+  rm -rf "$tmpdir"
+  LINUX_DIST_DIR="$original_linux_dist_dir"
+}
+
 main() {
   test_native_mode_uses_host_target_on_linux
   test_windows_mode_target_by_host_os
   test_all_mode_outputs_expected_targets
   test_invalid_mode_fails
+  test_package_linux_zip_creates_archive_with_artifacts
+  test_package_linux_zip_skips_when_no_artifacts
   echo "build_binaries tests passed"
 }
 

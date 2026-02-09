@@ -128,6 +128,31 @@ package_windows_zip() {
   echo "info: packaged Windows zip: $zip_path"
 }
 
+package_linux_zip() {
+  local zip_path="${LINUX_DIST_DIR}/ec2_manager_linux.zip"
+  local candidates=(
+    "${LINUX_DIST_DIR}/${CLI_APP_NAME}"
+    "${LINUX_DIST_DIR}/${GUI_APP_NAME}"
+  )
+  local files=()
+
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "$candidate" ]]; then
+      files+=("$candidate")
+    fi
+  done
+
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    echo "warning: no Linux artifacts found to package; skipping zip creation"
+    return 0
+  fi
+
+  require_cmd zip
+  rm -f "$zip_path"
+  zip -q -j "$zip_path" "${files[@]}"
+  echo "info: packaged Linux zip: $zip_path"
+}
+
 build_for_target() {
   local target="$1"
 
@@ -139,6 +164,11 @@ build_for_target() {
 
     (cd "$ROOT_DIR" && cargo build --release --features gui --bin "$GUI_APP_NAME")
     copy_artifact "$target" "$GUI_APP_NAME"
+    if [[ "$target" == *"windows"* ]]; then
+      package_windows_zip
+    else
+      package_linux_zip
+    fi
     return 0
   fi
 
@@ -167,6 +197,7 @@ build_for_target() {
     package_windows_zip
   else
     copy_artifact "$target" "$GUI_APP_NAME"
+    package_linux_zip
   fi
 }
 
