@@ -1,0 +1,11 @@
+[package]
+name = "ec2_manager"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+gui = ["dep:eframe"]
+
+[dependencies]
+eframe = { version = "0.30", optional = true }

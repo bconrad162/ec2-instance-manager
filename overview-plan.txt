@@ -1,0 +1,499 @@
+Project plan: EC2+SSM Instance Explorer (Tauri, profileChoice-only, Windows + Pop!_OS)
+Goal
+
+Desktop GUI that:
+
+Uses ~/.aws/profileChoice as the only AWS profile selector (read-only)
+
+Shows active AWS Profile / Account / Region prominently
+
+Lists EC2 instances and supports fast filtering by tags/search
+
+Indicates which instances are SSM-managed and online/offline
+
+Opens local terminal sessions via SSM (aws ssm start-session) using the detected terminals on the host
+
+Shows credential status (OK/Expired/Missing) but does not refresh credentials
+
+Non-goals
+
+No in-app login/credential refresh (you run saml2aws yourself)
+
+No AWS console/browser Session Manager
+
+No writing/modifying ~/.aws/profileChoice
+
+No AWS CI/CD services
+
+Target platforms
+
+Windows 11
+
+Pop!_OS 24.04 (COSMIC)
+
+Core workflow
+
+App reads ~/.aws/profileChoice → sets active profile.
+
+App calls STS GetCallerIdentity to show account + auth status.
+
+App fetches EC2 inventory and joins with SSM managed instances.
+
+User filters/searches and selects an instance.
+
+User clicks Connect → app opens a terminal on the local machine and runs:
+
+aws ssm start-session --target <instance-id> --region <region>
+
+with AWS_PROFILE=<profileChoice> in the spawned environment
+
+UI/UX plan
+Top bar (always visible)
+
+AWS Profile: value from ~/.aws/profileChoice (exact string)
+
+Auth status pill: OK / Expired / Missing
+
+Account: account ID (+ optional alias)
+
+Region: dropdown selector
+
+Refresh button
+
+Last updated timestamp
+
+Settings button
+
+Behavior:
+
+Watch ~/.aws/profileChoice. On change:
+
+Update profile display immediately
+
+Re-run STS check
+
+Clear cache and refresh inventory
+
+Update region persistence if account changes
+
+Left panel (filters)
+
+Search input (matches Name, InstanceId, IP, any tag value)
+
+State filter (multi-select): running/stopped/etc.
+
+Toggle: Only SSM-managed
+
+Tag facets (multi-select with counts + type-ahead):
+
+Env
+
+App/Service
+
+Role/Tier
+
+ASG name (derived)
+
+Team/Owner (optional facet)
+
+Saved filters:
+
+Save current filter, rename, delete
+
+Main panel (instances table)
+
+Sortable/resizable columns, keyboard navigable:
+
+Name
+
+Env
+
+App/Service
+
+Role
+
+State
+
+Private IP
+
+AZ
+
+ASG (optional)
+
+InstanceId
+
+SSM: Managed + Ping (Online/Offline)
+
+Row interactions:
+
+Single click selects
+
+Double-click connects (configurable)
+
+Context menu:
+
+Connect
+
+Connect as… (temporary terminal override)
+
+Port forward… (preset)
+
+Copy InstanceId / Private IP / Name
+
+Favorite/unfavorite
+
+Details/actions pane (right panel or bottom drawer)
+
+For selected instance:
+
+Summary + full tag viewer
+
+SSM managed + ping status (+ last seen if available)
+
+Buttons: Connect, Connect as…, Port forward, Copy
+
+Keyboard shortcuts (same on both OSes)
+
+/ focus search
+
+Arrow keys navigate table
+
+Enter connect selected
+
+Ctrl/Cmd+R refresh
+
+F favorite toggle
+
+Esc close dialogs / clear search
+
+Terminal launching (dynamic discovery + user-selectable default)
+Requirement
+
+App detects terminals available on the host OS at runtime and presents them in Settings. User selects a default; app persists it. Always provide a “Custom template” fallback.
+
+Windows terminal discovery (probe PATH + known locations)
+
+Detect and expose:
+
+PowerShell 7: pwsh.exe (preferred)
+
+Windows PowerShell: powershell.exe
+
+Windows Terminal: wt.exe
+
+Git Bash: bash.exe (PATH and common Git install dirs)
+
+CMD: cmd.exe
+
+WSL: wsl.exe (optionally enumerate distros via wsl -l -q)
+
+Default on Windows: PowerShell (pwsh if available, else powershell.exe)
+
+Pop!_OS terminal discovery (probe PATH)
+
+Detect and expose:
+
+COSMIC terminal (probe likely names such as cosmic-term, cosmic-terminal)
+
+gnome-terminal
+
+kitty
+
+alacritty
+
+konsole
+
+xterm
+
+Default on Pop!_OS: COSMIC terminal if found, else next available (gnome-terminal etc.)
+
+Launch adapters (normalize “run command in terminal”)
+
+Create an internal adapter per terminal type to open a terminal and run a command, keeping it open:
+
+PowerShell: -NoExit -Command "<cmd>"
+
+CMD: /k <cmd>
+
+Windows Terminal: open new tab/window with configured profile + run shell command
+
+Git Bash: bash -lc '<cmd>'
+
+WSL: wsl -d <distro> -- bash -lc '<cmd>'
+
+Linux terminals: terminal-specific “execute command” flags normalized in adapters
+
+Connect command
+
+For selected instance:
+
+Spawn terminal via chosen adapter
+
+Execute:
+
+aws ssm start-session --target <instance_id> --region <region>
+
+Set env for spawned process:
+
+AWS_PROFILE=<profileChoice>
+
+AWS_REGION=<region> (optional) or rely on --region
+
+Settings → Terminal
+
+Dropdown of Detected terminals
+
+Secondary selector if applicable (Windows Terminal profile, WSL distro)
+
+Option: open new tab vs new window (where supported)
+
+“Test launch” button (runs aws --version or echo)
+
+“Custom template” editor (advanced; placeholders: {instance_id}, {region}, {profile})
+
+Credential status (manual refresh)
+
+On startup and on profileChoice change:
+
+STS GetCallerIdentity
+
+Auth status states:
+
+OK (STS success)
+
+Expired (STS fails due to expired token/invalid creds)
+
+Missing (profileChoice empty or profile not found)
+
+If Expired/Missing:
+
+Show banner and disable refresh/inventory/connect actions that require AWS access (or allow refresh but show failure once)
+
+AWS data fetching
+Profile and region usage
+
+Profile: read from ~/.aws/profileChoice only
+
+Region precedence:
+
+user-selected in app (persisted)
+
+env AWS_REGION / AWS_DEFAULT_REGION
+
+~/.aws/config for that profile
+
+fallback (prompt or default)
+
+Persist last region per account ID.
+
+Inventory (EC2)
+
+DescribeInstances (paginate)
+
+Collect: InstanceId, state, private IP, AZ, instance type, launch time, tags
+
+Derive fields:
+
+Name from Name tag
+
+Env/App/Role from tag mapping (below)
+
+ASG from tags or instance metadata if available
+
+SSM join (managed + online/offline)
+
+DescribeInstanceInformation (paginate)
+
+Join by InstanceId:
+
+managed yes/no
+
+ping status online/offline
+
+last ping time if available
+
+Caching
+
+Cache inventory per (account, region) for 30–60 seconds
+
+Client-side filtering is instantaneous
+
+Refresh forces re-fetch
+
+Tag mapping (configurable and resilient)
+
+Settings allow multiple candidate keys per facet; first present wins:
+
+Env keys default: Env,Environment
+
+App keys default: App,Service
+
+Role keys default: Role,Tier
+
+Team keys optional: Team,Owner
+
+Favorites, recents, saved filters
+
+Persist locally:
+
+Favorites: per account/region
+
+Recents: last 20 connections (instanceId, name, region, timestamp)
+
+Saved filters: per account/region, with rename/delete
+
+Dependency checks and diagnostics
+
+On startup:
+
+Verify aws exists in PATH
+
+Verify session-manager-plugin exists in PATH
+If missing:
+
+Disable Connect/port-forward
+
+Show actionable message
+
+Optional diagnostics screen (v1.1):
+
+STS call result
+
+EC2 inventory permission check
+
+SSM inventory permission check
+
+Terminal discovery results
+
+Local storage and packaging
+Config paths
+
+Windows: %APPDATA%/<appname>/config.json
+
+Linux: ~/.config/<appname>/config.json
+
+Packaging
+
+Windows: installer or portable executable
+
+Pop!_OS: AppImage preferred (deb optional)
+
+Architecture (Tauri)
+Backend (Rust)
+
+Modules:
+
+profile_choice
+
+read ~/.aws/profileChoice
+
+watch for changes (debounced)
+
+aws_context
+
+STS identity + auth status
+
+region resolution
+
+inventory
+
+EC2 DescribeInstances pagination
+
+SSM DescribeInstanceInformation pagination
+
+join + caching
+
+terminal_discovery
+
+OS-specific probes
+
+return list of terminals + capabilities
+
+terminal_launch
+
+adapters + command templating
+
+spawn terminal with env vars
+
+storage
+
+config persistence (regions per account, terminal selection, tag mapping, favorites, recents, filters)
+
+Expose Tauri commands/events:
+
+get_current_context (profile/account/region/auth)
+
+refresh_inventory
+
+list_terminals
+
+connect_instance(instance_id, terminal_override?)
+
+port_forward(instance_id, preset)
+
+save_config / load_config
+
+watch events: profileChanged, authChanged, inventoryUpdated
+
+Frontend (Tauri UI)
+
+Screens:
+
+Main: top bar + filters + table + details
+
+Settings: region behavior, terminal selection, tag mapping, port-forward presets, shortcuts
+
+(Optional) Diagnostics
+
+Milestones
+v1 (MVP)
+
+profileChoice read + watch
+
+STS identity + auth status pill
+
+region selector + persistence per account
+
+EC2 inventory fetch + cache
+
+SSM join + “Only SSM-managed” filter
+
+table + search + facets + details pane
+
+dynamic terminal discovery (Windows + Pop)
+
+connect + connect-as + favorites + recents
+
+dependency checks (aws + session-manager-plugin)
+
+v1.1
+
+port-forward presets UI + action
+
+saved filters management polish
+
+diagnostics screen
+
+column layout persistence + shortcut polish
+
+v2 (optional)
+
+open-in-console links
+
+multi-region tabs
+
+additional SSM features (run command templates)
+
+Acceptance criteria (high-level)
+
+Always shows active AWS profile from ~/.aws/profileChoice on top bar.
+
+Switching profile via your CLI updates the GUI automatically within seconds.
+
+Filtering by tags/search is fast and does not require AWS calls.
+
+“Connect” opens the chosen terminal and starts an interactive SSM session without browser usage.
+
+Works on Windows and Pop!_OS, dynamically listing terminals available on each system.
+
+Clear “Expired creds” state when saml2aws session expires; user refreshes externally.
