@@ -11,15 +11,16 @@ fn main() {
 mod gui {
     use std::collections::{HashMap, VecDeque};
     use std::fs;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{Read, Write};
     use std::path::PathBuf;
-    #[cfg(target_os = "windows")]
-    use std::os::windows::process::CommandExt;
+    #[cfg(test)]
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc::{self, Receiver, Sender};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
 
     use eframe::egui;
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
     use ec2_manager::aws_context::build_context;
     use ec2_manager::config::AppConfig;
@@ -47,8 +48,7 @@ mod gui {
     const GUI_MIN_HEIGHT: f32 = 760.0;
     const PROFILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
     const PROFILE_CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
-    #[cfg(target_os = "windows")]
-    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(450);
 
     const COL_FAV_W: f32 = 44.0;
     const COL_INSTANCE_W: f32 = 150.0;
@@ -155,9 +155,15 @@ mod gui {
     }
 
     enum ProcEvent {
-        Line { tab_id: u64, line: String },
+        Output { tab_id: u64, bytes: Vec<u8> },
         Exited { tab_id: u64, code: i32 },
         Error { tab_id: u64, error: String },
+    }
+
+    struct PtySession {
+        child: Box<dyn portable_pty::Child + Send>,
+        writer: Arc<Mutex<Box<dyn Write + Send>>>,
+        parser: vt100::Parser,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -314,14 +320,13 @@ mod gui {
         log_filters: LogFilters,
         terminals: Vec<TerminalOption>,
         selected_terminal_id: String,
-        tab_input_by_id: HashMap<u64, String>,
         profile_choice_path: Option<PathBuf>,
         last_profile_choice_mtime: Option<SystemTime>,
         pending_profile_choice_mtime: Option<SystemTime>,
         pending_profile_change_since: Option<SystemTime>,
         last_profile_poll_at: Instant,
         connections: ConnectionTabs,
-        children: HashMap<u64, Child>,
+        pty_sessions: HashMap<u64, PtySession>,
         proc_tx: Sender<ProcEvent>,
         proc_rx: Receiver<ProcEvent>,
     }
@@ -363,14 +368,13 @@ mod gui {
                 log_filters: LogFilters::default(),
                 terminals,
                 selected_terminal_id,
-                tab_input_by_id: HashMap::new(),
                 profile_choice_path,
                 last_profile_choice_mtime,
                 pending_profile_choice_mtime: None,
                 pending_profile_change_since: None,
                 last_profile_poll_at: Instant::now(),
                 connections: ConnectionTabs::new(),
-                children: HashMap::new(),
+                pty_sessions: HashMap::new(),
                 proc_tx,
                 proc_rx,
             };
@@ -448,10 +452,6 @@ mod gui {
 
         fn log_debug(&mut self, message: impl Into<String>) {
             self.log(LogLevel::Debug, message);
-        }
-
-        fn log_trace(&mut self, message: impl Into<String>) {
-            self.log(LogLevel::Trace, message);
         }
 
         fn selected_terminal(&self) -> Option<&TerminalOption> {
@@ -674,9 +674,9 @@ mod gui {
             }
             self.connections.append_line(
                 tab_id,
-                "SSM command is prefilled below. Edit and press Send when ready.".to_string(),
+                "SSM command is auto-sent. Click terminal area to focus and type directly."
+                    .to_string(),
             );
-            self.tab_input_by_id.insert(tab_id, command.clone());
 
             if context.mode == Mode::Live {
                 self.connections.append_line(
@@ -694,70 +694,11 @@ mod gui {
                 return Ok(());
             }
 
-            let (program, args) = shell_plan(selected_terminal.as_ref());
-            self.log_debug(format!("spawning shell command via {program}"));
-            let mut child_cmd = Command::new(&program);
-            child_cmd
-                .args(args)
-                .env("AWS_PROFILE", &context.profile)
-                .env("AWS_REGION", &context.region)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .stdin(Stdio::piped());
-            #[cfg(target_os = "windows")]
-            child_cmd.creation_flags(CREATE_NO_WINDOW);
-            let mut child = child_cmd.spawn().map_err(|err| {
-                AppError::Parse(format!("Failed to start embedded process: {err}"))
-            })?;
-
-            if let Some(stdout) = child.stdout.take() {
-                let tx = self.proc_tx.clone();
-                std::thread::spawn(move || {
-                    let reader = BufReader::new(stdout);
-                    for line in reader.lines() {
-                        match line {
-                            Ok(v) => {
-                                let _ = tx.send(ProcEvent::Line { tab_id, line: v });
-                            }
-                            Err(err) => {
-                                let _ = tx.send(ProcEvent::Error {
-                                    tab_id,
-                                    error: err.to_string(),
-                                });
-                                break;
-                            }
-                        }
-                    }
-                });
-            }
-
-            if let Some(stderr) = child.stderr.take() {
-                let tx = self.proc_tx.clone();
-                std::thread::spawn(move || {
-                    let reader = BufReader::new(stderr);
-                    for line in reader.lines() {
-                        match line {
-                            Ok(v) => {
-                                let _ = tx.send(ProcEvent::Line {
-                                    tab_id,
-                                    line: format!("[stderr] {v}"),
-                                });
-                            }
-                            Err(err) => {
-                                let _ = tx.send(ProcEvent::Error {
-                                    tab_id,
-                                    error: err.to_string(),
-                                });
-                                break;
-                            }
-                        }
-                    }
-                });
-            }
-
-            self.children.insert(tab_id, child);
+            self.spawn_pty_session(tab_id, selected_terminal.as_ref(), context)?;
             if should_auto_send_prefilled_command(self.options.dry_run) {
-                self.send_to_connection_tab(tab_id, command.clone());
+                let mut payload = command.into_bytes();
+                payload.push(b'\n');
+                self.send_raw_bytes_to_connection_tab(tab_id, &payload);
                 self.log_info(format!("tab={tab_id} auto-sent prefilled command"));
             }
 
@@ -777,12 +718,89 @@ mod gui {
             Ok(())
         }
 
+        fn spawn_pty_session(
+            &mut self,
+            tab_id: u64,
+            terminal: Option<&TerminalOption>,
+            context: &AwsContext,
+        ) -> Result<()> {
+            let (program, args) = shell_plan(terminal);
+            self.log_debug(format!("spawning PTY shell via {program}"));
+
+            let pty_system = native_pty_system();
+            let pair = pty_system
+                .openpty(PtySize {
+                    rows: 45,
+                    cols: 180,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|err| AppError::Parse(format!("Failed to allocate PTY: {err}")))?;
+
+            let mut cmd = CommandBuilder::new(program);
+            for arg in args {
+                cmd.arg(arg);
+            }
+            cmd.env("AWS_PROFILE", &context.profile);
+            cmd.env("AWS_REGION", &context.region);
+
+            let child = pair
+                .slave
+                .spawn_command(cmd)
+                .map_err(|err| AppError::Parse(format!("Failed to spawn PTY shell: {err}")))?;
+            drop(pair.slave);
+
+            let mut reader = pair
+                .master
+                .try_clone_reader()
+                .map_err(|err| AppError::Parse(format!("Failed to create PTY reader: {err}")))?;
+            let writer = pair
+                .master
+                .take_writer()
+                .map_err(|err| AppError::Parse(format!("Failed to create PTY writer: {err}")))?;
+
+            let tx = self.proc_tx.clone();
+            std::thread::spawn(move || {
+                let mut buf = [0_u8; 8192];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let _ = tx.send(ProcEvent::Output {
+                                tab_id,
+                                bytes: buf[..n].to_vec(),
+                            });
+                        }
+                        Err(err) => {
+                            let _ = tx.send(ProcEvent::Error {
+                                tab_id,
+                                error: err.to_string(),
+                            });
+                            break;
+                        }
+                    }
+                }
+            });
+
+            self.pty_sessions.insert(
+                tab_id,
+                PtySession {
+                    child,
+                    writer: Arc::new(Mutex::new(writer)),
+                    parser: vt100::Parser::new(45, 180, 10_000),
+                },
+            );
+            Ok(())
+        }
+
         fn poll_connection_events(&mut self) {
             while let Ok(event) = self.proc_rx.try_recv() {
                 match event {
-                    ProcEvent::Line { tab_id, line } => {
-                        self.log_trace(format!("tab={tab_id} {line}"));
-                        self.connections.append_line(tab_id, line)
+                    ProcEvent::Output { tab_id, bytes } => {
+                        self.log(LogLevel::Trace, format!("tab={tab_id} output bytes={}", bytes.len()));
+                        if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                            session.parser.process(&bytes);
+                        }
                     }
                     ProcEvent::Error { tab_id, error } => {
                         self.log_error(format!("tab={tab_id} process error: {error}"));
@@ -800,10 +818,10 @@ mod gui {
 
             let mut exited = Vec::new();
             let mut wait_errors: Vec<String> = Vec::new();
-            for (tab_id, child) in &mut self.children {
-                match child.try_wait() {
+            for (tab_id, session) in &mut self.pty_sessions {
+                match session.child.try_wait() {
                     Ok(Some(status)) => {
-                        exited.push((*tab_id, status.code().unwrap_or(-1)));
+                        exited.push((*tab_id, status.exit_code() as i32));
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -819,44 +837,36 @@ mod gui {
             }
 
             for (tab_id, code) in exited {
-                self.children.remove(&tab_id);
+                self.pty_sessions.remove(&tab_id);
                 let _ = self.proc_tx.send(ProcEvent::Exited { tab_id, code });
             }
         }
 
         fn close_connection_tab(&mut self, tab_id: u64) {
-            if let Some(mut child) = self.children.remove(&tab_id) {
-                terminate_child(&mut child);
+            if let Some(mut session) = self.pty_sessions.remove(&tab_id) {
+                let _ = session.child.kill();
+                let _ = session.child.wait();
             }
             self.connections.close(tab_id);
-            self.tab_input_by_id.remove(&tab_id);
             self.log_info(format!("closed connection tab id={tab_id}"));
         }
 
-        fn send_to_connection_tab(&mut self, tab_id: u64, input: String) {
-            let trimmed = input.trim_end().to_string();
-            if trimmed.is_empty() {
-                return;
-            }
-            self.connections.append_line(tab_id, format!("> {trimmed}"));
-
-            let Some(child) = self.children.get_mut(&tab_id) else {
-                self.connections
-                    .append_line(tab_id, "[input] no running process".to_string());
+        fn send_raw_bytes_to_connection_tab(&mut self, tab_id: u64, payload: &[u8]) {
+            let Some(session) = self.pty_sessions.get(&tab_id) else {
                 return;
             };
-
-            let Some(stdin) = child.stdin.as_mut() else {
-                self.connections
-                    .append_line(tab_id, "[input] process stdin unavailable".to_string());
+            let Ok(mut stdin) = session.writer.lock() else {
                 return;
             };
+            let _ = stdin.write_all(payload);
+        }
 
-            let mut payload = trimmed;
-            payload.push('\n');
-            if let Err(err) = stdin.write_all(payload.as_bytes()) {
-                self.connections
-                    .append_line(tab_id, format!("[input error] {err}"));
+        fn forward_terminal_key_input(&mut self, ctx: &egui::Context, tab_id: u64) {
+            let events = ctx.input(|i| i.raw.events.clone());
+            for event in events {
+                if let Some(payload) = terminal_event_payload(&event) {
+                    self.send_raw_bytes_to_connection_tab(tab_id, &payload);
+                }
             }
         }
 
@@ -1220,25 +1230,22 @@ mod gui {
                 ));
                 ui.separator();
 
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    for line in &tab.lines {
-                        ui.monospace(line);
-                    }
-                });
+                let show_cursor = ui.input(|i| ((i.time * 2.0) as i64) % 2 == 0);
+                let terminal_text = self
+                    .pty_sessions
+                    .get(&tab.id)
+                    .map(|s| terminal_text_with_cursor(s.parser.screen(), show_cursor))
+                    .unwrap_or_else(|| tab.lines.join("\n"));
 
-                ui.separator();
-                let mut send_clicked = false;
-                let entry = self.tab_input_by_id.entry(tab.id).or_default();
-                ui.horizontal(|ui| {
-                    ui.label("Input");
-                    let response = ui.text_edit_singleline(entry);
-                    let enter_pressed =
-                        response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    send_clicked = ui.button("Send").clicked() || enter_pressed;
+                let terminal_response = egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(terminal_text).monospace())
+                            .sense(egui::Sense::click()),
+                    )
                 });
-                if send_clicked {
-                    let current = self.tab_input_by_id.get(&tab.id).cloned().unwrap_or_default();
-                    self.send_to_connection_tab(tab.id, current);
+                let terminal_clicked = terminal_response.inner.clicked();
+                if terminal_clicked || tab.running {
+                    self.forward_terminal_key_input(ui.ctx(), tab.id);
                 }
             }
         }
@@ -1310,6 +1317,9 @@ mod gui {
         fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
             self.poll_profile_choice_changes();
             self.poll_connection_events();
+            if self.main_tab == MainTab::Connections && !self.pty_sessions.is_empty() {
+                ctx.request_repaint_after(CURSOR_BLINK_INTERVAL);
+            }
 
             egui::TopBottomPanel::top("top").show(ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -1627,13 +1637,13 @@ mod gui {
                     terminal
                         .map(|t| t.program.clone())
                         .unwrap_or_else(|| "bash".to_string()),
-                    vec!["-i".to_string()],
+                    Vec::new(),
                 ),
                 Some("wsl") => (
                     terminal
                         .map(|t| t.program.clone())
                         .unwrap_or_else(|| "wsl".to_string()),
-                    vec!["--".to_string(), "bash".to_string(), "-i".to_string()],
+                    vec!["--".to_string(), "bash".to_string()],
                 ),
                 _ => ("cmd".to_string(), vec!["/Q".to_string(), "/K".to_string()]),
             }
@@ -1642,6 +1652,7 @@ mod gui {
         }
     }
 
+    #[cfg(test)]
     fn terminate_child(child: &mut Child) {
         let _ = child.kill();
         let _ = child.wait();
@@ -1706,6 +1717,68 @@ mod gui {
 
     fn should_auto_send_prefilled_command(dry_run: bool) -> bool {
         !dry_run
+    }
+
+    fn terminal_text_with_cursor(screen: &vt100::Screen, show_cursor: bool) -> String {
+        let (rows, cols) = screen.size();
+        let mut row_texts: Vec<Vec<char>> = screen
+            .rows(0, cols)
+            .map(|line| line.chars().collect::<Vec<char>>())
+            .collect();
+        if row_texts.len() < rows as usize {
+            row_texts.resize(rows as usize, Vec::new());
+        }
+
+        if show_cursor {
+            let (row, col) = screen.cursor_position();
+            let row_idx = row as usize;
+            let col_idx = col as usize;
+            if row_idx >= row_texts.len() {
+                row_texts.resize(row_idx + 1, Vec::new());
+            }
+            let line = &mut row_texts[row_idx];
+            while line.len() < col_idx {
+                line.push(' ');
+            }
+            if col_idx < line.len() {
+                line[col_idx] = '|';
+            } else {
+                line.push('|');
+            }
+        }
+
+        row_texts
+            .into_iter()
+            .map(|chars| chars.into_iter().collect::<String>())
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+
+    fn terminal_event_payload(event: &egui::Event) -> Option<Vec<u8>> {
+        match event {
+            egui::Event::Text(text) => Some(text.as_bytes().to_vec()),
+            egui::Event::Paste(text) => Some(text.as_bytes().to_vec()),
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => match key {
+                egui::Key::Enter => Some(b"\r".to_vec()),
+                egui::Key::Backspace => Some(vec![0x7f]),
+                egui::Key::Tab => Some(b"\t".to_vec()),
+                egui::Key::Escape => Some(vec![0x1b]),
+                egui::Key::ArrowUp => Some(b"\x1b[A".to_vec()),
+                egui::Key::ArrowDown => Some(b"\x1b[B".to_vec()),
+                egui::Key::ArrowRight => Some(b"\x1b[C".to_vec()),
+                egui::Key::ArrowLeft => Some(b"\x1b[D".to_vec()),
+                egui::Key::C if modifiers.ctrl => Some(vec![0x03]),
+                egui::Key::D if modifiers.ctrl => Some(vec![0x04]),
+                egui::Key::L if modifiers.ctrl => Some(vec![0x0c]),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     fn initial_terminal_id(config: &AppConfig, terminals: &[TerminalOption]) -> String {
@@ -1805,15 +1878,80 @@ mod gui {
             )
             .expect("dry-run open should succeed");
 
-            assert!(app.children.is_empty());
-            let prefill = app.tab_input_by_id.values().next().cloned().unwrap_or_default();
-            assert_eq!(prefill, "echo hi");
+            assert!(app.pty_sessions.is_empty());
             let selected = app
                 .connections
                 .selected_ref()
                 .expect("tab should be selected");
             assert!(!selected.running);
             assert!(selected.lines.iter().any(|line| line.contains("[dry-run]")));
+        }
+
+        #[test]
+        fn sim_mode_open_connection_tab_spawns_interactive_terminal_session() {
+            let mut app = Ec2GuiApp::new(GuiOptions {
+                mode: Mode::Sim,
+                region: None,
+                dry_run: false,
+            });
+            let context = AwsContext {
+                mode: Mode::Sim,
+                profile: "sim-profile".to_string(),
+                account_id: Some("000000000000".to_string()),
+                arn: None,
+                user_id: None,
+                region: "us-east-1".to_string(),
+                auth_status: AuthStatus::Ok,
+            };
+
+            let open_result = app.open_connection_tab(
+                "api-a".to_string(),
+                "i-sim0001".to_string(),
+                "echo terminal-ok".to_string(),
+                &context,
+            );
+            if let Err(AppError::Parse(message)) = &open_result {
+                if message.contains("Permission denied") {
+                    // Some CI/sandbox environments disallow openpty.
+                    return;
+                }
+            }
+            open_result.expect("sim open should spawn PTY session");
+
+            // Allow PTY reader thread to publish output and parser to consume it.
+            for _ in 0..60 {
+                app.poll_connection_events();
+                let contains_marker = app
+                    .pty_sessions
+                    .values()
+                    .next()
+                    .map(|s| s.parser.screen().contents().contains("terminal-ok"))
+                    .unwrap_or(false);
+                if contains_marker {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            assert_eq!(app.pty_sessions.len(), 1);
+            let parsed = app
+                .pty_sessions
+                .values()
+                .next()
+                .expect("session should exist")
+                .parser
+                .screen()
+                .contents();
+            assert!(
+                parsed.contains("terminal-ok"),
+                "expected PTY buffer to contain echoed marker, got: {parsed}"
+            );
+
+            let tab_id = app
+                .connections
+                .selected()
+                .expect("selected connection tab should exist");
+            app.close_connection_tab(tab_id);
         }
 
         #[test]
@@ -2002,6 +2140,52 @@ mod gui {
         fn auto_send_prefilled_command_is_disabled_for_dry_run_only() {
             assert!(!should_auto_send_prefilled_command(true));
             assert!(should_auto_send_prefilled_command(false));
+        }
+
+        #[test]
+        fn terminal_event_payload_maps_ctrl_c_enter_and_paste() {
+            let ctrl_c = egui::Event::Key {
+                key: egui::Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            };
+            assert_eq!(terminal_event_payload(&ctrl_c), Some(vec![0x03]));
+
+            let enter = egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            };
+            assert_eq!(terminal_event_payload(&enter), Some(b"\r".to_vec()));
+
+            let paste = egui::Event::Paste("echo hi".to_string());
+            assert_eq!(
+                terminal_event_payload(&paste),
+                Some("echo hi".as_bytes().to_vec())
+            );
+        }
+
+        #[test]
+        fn terminal_text_with_cursor_places_cursor_marker() {
+            let mut parser = vt100::Parser::new(3, 20, 100);
+            parser.process(b"hello");
+            let text = terminal_text_with_cursor(parser.screen(), true);
+            assert!(text.lines().next().unwrap_or_default().contains("hello|"));
+        }
+
+        #[test]
+        fn terminal_text_with_cursor_can_hide_marker() {
+            let mut parser = vt100::Parser::new(2, 10, 100);
+            parser.process(b"abc");
+            let text = terminal_text_with_cursor(parser.screen(), false);
+            assert!(!text.lines().next().unwrap_or_default().contains('|'));
         }
     }
 }
