@@ -13,6 +13,8 @@ mod gui {
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
     use std::path::PathBuf;
+    #[cfg(target_os = "windows")]
+    use std::os::windows::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use std::sync::mpsc::{self, Receiver, Sender};
     use std::time::{Duration, Instant, SystemTime};
@@ -45,6 +47,8 @@ mod gui {
     const GUI_MIN_HEIGHT: f32 = 760.0;
     const PROFILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
     const PROFILE_CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
+    #[cfg(target_os = "windows")]
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
 
     const COL_FAV_W: f32 = 44.0;
     const COL_INSTANCE_W: f32 = 150.0;
@@ -692,17 +696,19 @@ mod gui {
 
             let (program, args) = shell_plan(selected_terminal.as_ref());
             self.log_debug(format!("spawning shell command via {program}"));
-            let mut child = Command::new(program)
+            let mut child_cmd = Command::new(&program);
+            child_cmd
                 .args(args)
                 .env("AWS_PROFILE", &context.profile)
                 .env("AWS_REGION", &context.region)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
-                .stdin(Stdio::piped())
-                .spawn()
-                .map_err(|err| {
-                    AppError::Parse(format!("Failed to start embedded process: {err}"))
-                })?;
+                .stdin(Stdio::piped());
+            #[cfg(target_os = "windows")]
+            child_cmd.creation_flags(CREATE_NO_WINDOW);
+            let mut child = child_cmd.spawn().map_err(|err| {
+                AppError::Parse(format!("Failed to start embedded process: {err}"))
+            })?;
 
             if let Some(stdout) = child.stdout.take() {
                 let tx = self.proc_tx.clone();
