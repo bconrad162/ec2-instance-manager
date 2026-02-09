@@ -44,6 +44,7 @@ mod gui {
     const GUI_MIN_WIDTH: f32 = 1280.0;
     const GUI_MIN_HEIGHT: f32 = 760.0;
     const PROFILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+    const PROFILE_CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
 
     const COL_FAV_W: f32 = 44.0;
     const COL_INSTANCE_W: f32 = 150.0;
@@ -311,6 +312,8 @@ mod gui {
         selected_terminal_id: String,
         profile_choice_path: Option<PathBuf>,
         last_profile_choice_mtime: Option<SystemTime>,
+        pending_profile_choice_mtime: Option<SystemTime>,
+        pending_profile_change_since: Option<SystemTime>,
         last_profile_poll_at: Instant,
         connections: ConnectionTabs,
         children: HashMap<u64, Child>,
@@ -357,6 +360,8 @@ mod gui {
                 selected_terminal_id,
                 profile_choice_path,
                 last_profile_choice_mtime,
+                pending_profile_choice_mtime: None,
+                pending_profile_change_since: None,
                 last_profile_poll_at: Instant::now(),
                 connections: ConnectionTabs::new(),
                 children: HashMap::new(),
@@ -374,12 +379,35 @@ mod gui {
                 return;
             }
             self.last_profile_poll_at = Instant::now();
+            let now = SystemTime::now();
 
             let current_mtime = profile_choice_mtime(self.profile_choice_path.as_deref());
-            if !profile_choice_changed(self.last_profile_choice_mtime, current_mtime) {
+
+            // Reset pending state if file is back to the already-applied mtime.
+            if current_mtime == self.last_profile_choice_mtime {
+                self.pending_profile_choice_mtime = None;
+                self.pending_profile_change_since = None;
                 return;
             }
 
+            // Start or restart debounce window when mtime changes.
+            if self.pending_profile_choice_mtime != current_mtime {
+                self.pending_profile_choice_mtime = current_mtime;
+                self.pending_profile_change_since = Some(now);
+                self.log_debug("profileChoice changed; waiting for debounce window");
+                return;
+            }
+
+            if !profile_change_debounce_elapsed(
+                self.pending_profile_change_since,
+                now,
+                PROFILE_CHANGE_DEBOUNCE,
+            ) {
+                return;
+            }
+
+            self.pending_profile_choice_mtime = None;
+            self.pending_profile_change_since = None;
             self.last_profile_choice_mtime = current_mtime;
             self.log_info("detected profileChoice change, refreshing context and inventory");
             if let Err(err) = self.refresh_context_and_inventory(true) {
@@ -1555,11 +1583,26 @@ mod gui {
         fs::metadata(path).ok()?.modified().ok()
     }
 
+    #[cfg(test)]
     fn profile_choice_changed(
         previous: Option<SystemTime>,
         current: Option<SystemTime>,
     ) -> bool {
         previous != current
+    }
+
+    fn profile_change_debounce_elapsed(
+        started_at: Option<SystemTime>,
+        now: SystemTime,
+        debounce: Duration,
+    ) -> bool {
+        let Some(started_at) = started_at else {
+            return false;
+        };
+        match now.duration_since(started_at) {
+            Ok(elapsed) => elapsed >= debounce,
+            Err(_) => false,
+        }
     }
 
     fn format_connection_summary_line(
@@ -1795,6 +1838,33 @@ mod gui {
             let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
             assert!(!profile_choice_changed(Some(t1), Some(t1)));
             assert!(!profile_choice_changed(None, None));
+        }
+
+        #[test]
+        fn profile_change_debounce_elapsed_when_duration_met() {
+            let started = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+            let now = SystemTime::UNIX_EPOCH + Duration::from_secs(13);
+            assert!(profile_change_debounce_elapsed(
+                Some(started),
+                now,
+                Duration::from_secs(2)
+            ));
+        }
+
+        #[test]
+        fn profile_change_debounce_not_elapsed_when_too_soon_or_missing_start() {
+            let started = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+            let now = SystemTime::UNIX_EPOCH + Duration::from_secs(11);
+            assert!(!profile_change_debounce_elapsed(
+                Some(started),
+                now,
+                Duration::from_secs(2)
+            ));
+            assert!(!profile_change_debounce_elapsed(
+                None,
+                now,
+                Duration::from_secs(2)
+            ));
         }
 
         #[test]

@@ -61,6 +61,17 @@ pub fn discover_terminals() -> Vec<TerminalOption> {
             TerminalKind::GitBash,
             &["bash.exe"],
         );
+        for candidate in windows_msys2_bash_candidates() {
+            if candidate.is_file() && !out.iter().any(|t| t.id == "msys2-bash") {
+                out.push(TerminalOption {
+                    id: "msys2-bash".to_string(),
+                    display_name: "MSYS2 Bash".to_string(),
+                    kind: TerminalKind::GitBash,
+                    program: candidate.to_string_lossy().to_string(),
+                });
+                break;
+            }
+        }
         push_if_found(
             &mut out,
             "cmd",
@@ -159,6 +170,29 @@ fn windows_git_bash_candidates() -> Vec<PathBuf> {
     out
 }
 
+fn windows_msys2_bash_candidates() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+
+    if let Some(root) = std::env::var_os("MSYS2_ROOT") {
+        out.push(PathBuf::from(root).join("usr").join("bin").join("bash.exe"));
+    }
+
+    out.push(
+        PathBuf::from(r"C:\msys64")
+            .join("usr")
+            .join("bin")
+            .join("bash.exe"),
+    );
+    out.push(
+        PathBuf::from(r"C:\tools\msys64")
+            .join("usr")
+            .join("bin")
+            .join("bash.exe"),
+    );
+
+    out
+}
+
 pub fn pick_default_terminal(
     config: &AppConfig,
     terminals: &[TerminalOption],
@@ -170,7 +204,15 @@ pub fn pick_default_terminal(
     }
 
     let preferred = if cfg!(windows) {
-        vec!["pwsh", "powershell", "wt", "cmd", "git-bash", "wsl"]
+        vec![
+            "pwsh",
+            "powershell",
+            "wt",
+            "cmd",
+            "msys2-bash",
+            "git-bash",
+            "wsl",
+        ]
     } else {
         vec![
             "cosmic-term",
@@ -448,5 +490,28 @@ mod tests {
         let cmd = build_ssm_port_forward_command("i-abc", "us-east-1", 15432, 5432);
         assert!(!cmd.contains('\''));
         assert!(!cmd.contains('"'));
+    }
+
+    #[test]
+    fn pick_default_terminal_prefers_saved_terminal_id() {
+        let mut config = AppConfig::default();
+        config.default_terminal = Some("msys2-bash".to_string());
+        let terminals = vec![
+            TerminalOption {
+                id: "pwsh".to_string(),
+                display_name: "PowerShell 7".to_string(),
+                kind: TerminalKind::PowerShell7,
+                program: "pwsh".to_string(),
+            },
+            TerminalOption {
+                id: "msys2-bash".to_string(),
+                display_name: "MSYS2 Bash".to_string(),
+                kind: TerminalKind::GitBash,
+                program: "C:\\msys64\\usr\\bin\\bash.exe".to_string(),
+            },
+        ];
+
+        let got = pick_default_terminal(&config, &terminals).expect("terminal selected");
+        assert_eq!(got.id, "msys2-bash");
     }
 }

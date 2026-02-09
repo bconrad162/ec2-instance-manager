@@ -2,6 +2,12 @@ use std::process::Command;
 
 use crate::error::{AppError, Result};
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 pub fn run_aws_cli(profile: Option<&str>, region: Option<&str>, args: &[&str]) -> Result<String> {
     let mut final_args: Vec<String> = Vec::new();
 
@@ -23,6 +29,8 @@ pub fn run_aws_cli(profile: Option<&str>, region: Option<&str>, args: &[&str]) -
 pub fn run_capture(program: &str, args: &[String], envs: &[(String, String)]) -> Result<String> {
     let mut cmd = Command::new(program);
     cmd.args(args);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
 
     for (k, v) in envs {
         cmd.env(k, v);
