@@ -210,6 +210,11 @@ mod gui {
         Error { tab_id: u64, error: String },
     }
 
+    enum UiEvent {
+        PtyReady { tab_id: u64, session: PtySession },
+        Error { tab_id: u64, error: String },
+    }
+
     struct PtySession {
         child: Box<dyn portable_pty::Child + Send>,
         writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -467,6 +472,8 @@ mod gui {
         pending_sends: HashMap<u64, PendingSend>,
         proc_tx: Sender<ProcEvent>,
         proc_rx: Receiver<ProcEvent>,
+        ui_tx: Sender<UiEvent>,
+        ui_rx: Receiver<UiEvent>,
     }
 
     impl Ec2GuiApp {
@@ -476,6 +483,7 @@ mod gui {
             let config = AppConfig::load().unwrap_or_default();
             let dependencies = dependency_status();
             let (proc_tx, proc_rx) = mpsc::channel();
+            let (ui_tx, ui_rx) = mpsc::channel();
             let profile_choice_path = profile_choice_path();
             let last_profile_choice_mtime = profile_choice_mtime(profile_choice_path.as_deref());
             let terminals = discover_terminals();
@@ -522,6 +530,8 @@ mod gui {
                 pending_sends: HashMap::new(),
                 proc_tx,
                 proc_rx,
+                ui_tx,
+                ui_rx,
             };
 
             app.log_info("application started");
@@ -967,14 +977,34 @@ mod gui {
             #[cfg(target_os = "windows")]
             {
                 if should_try_pty() {
-                    if let Err(err) =
-                        self.spawn_pty_session(tab_id, selected_terminal.as_ref(), context)
-                    {
-                        self.log_warn(format!(
-                            "PTY session failed on Windows; falling back to pipe mode: {err}"
-                        ));
-                        self.spawn_pipe_session(tab_id, selected_terminal.as_ref(), context)?;
-                    }
+                    let terminal = selected_terminal.clone();
+                    let context = context.clone();
+                    let proc_tx = self.proc_tx.clone();
+                    let ui_tx = self.ui_tx.clone();
+                    let (program, args) = shell_plan(terminal.as_ref());
+                    self.log_debug(format!("spawning PTY shell via {program}"));
+                    self.log_trace(format!(
+                        "pty shell args: {:?} terminal={}",
+                        args,
+                        terminal_debug_label(terminal.as_ref())
+                    ));
+                    self.log_debug("spawning PTY shell async");
+                    std::thread::spawn(move || {
+                        let result = spawn_pty_session_blocking(
+                            tab_id,
+                            terminal,
+                            context,
+                            proc_tx,
+                        );
+                        let event = match result {
+                            Ok(session) => UiEvent::PtyReady { tab_id, session },
+                            Err(err) => UiEvent::Error {
+                                tab_id,
+                                error: err.to_string(),
+                            },
+                        };
+                        let _ = ui_tx.send(event);
+                    });
                 } else {
                     self.spawn_pipe_session(tab_id, selected_terminal.as_ref(), context)?;
                 }
@@ -1112,6 +1142,7 @@ mod gui {
             Ok(())
         }
 
+        #[cfg(not(target_os = "windows"))]
         fn spawn_pty_session(
             &mut self,
             tab_id: u64,
@@ -1125,92 +1156,13 @@ mod gui {
                 args,
                 terminal_debug_label(terminal)
             ));
-
-            let pty_system = native_pty_system();
-            let pair = pty_system
-                .openpty(PtySize {
-                    rows: 45,
-                    cols: 180,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .map_err(|err| AppError::Parse(format!("Failed to allocate PTY: {err}")))?;
-
-            let mut cmd = CommandBuilder::new(program);
-            for arg in args {
-                cmd.arg(arg);
-            }
-            cmd.env("AWS_PROFILE", &context.profile);
-            cmd.env("AWS_REGION", &context.region);
-            #[cfg(target_os = "windows")]
-            {
-                if let Some(terminal) = terminal {
-                    if terminal.kind == TerminalKind::GitBash {
-                        if let Some(updated) = windows_bash_augmented_path(&terminal.program) {
-                            self.log_trace(format!("msys PATH len={}", updated.len()));
-                            cmd.env("PATH", updated);
-                        }
-                        cmd.env("MSYSTEM", "MSYS");
-                        cmd.env("CHERE_INVOKING", "1");
-                    }
-                }
-                let system_root = windows_system_root();
-                let comspec = windows_cmd_path();
-                cmd.env("SystemRoot", &system_root);
-                cmd.env("WINDIR", &system_root);
-                cmd.env("ComSpec", &comspec);
-                self.log_trace(format!(
-                    "pty env SystemRoot={} ComSpec={}",
-                    system_root, comspec
-                ));
-            }
-
-            let child = pair
-                .slave
-                .spawn_command(cmd)
-                .map_err(|err| AppError::Parse(format!("Failed to spawn PTY shell: {err}")))?;
-            drop(pair.slave);
-
-            let mut reader = pair
-                .master
-                .try_clone_reader()
-                .map_err(|err| AppError::Parse(format!("Failed to create PTY reader: {err}")))?;
-            let writer = pair
-                .master
-                .take_writer()
-                .map_err(|err| AppError::Parse(format!("Failed to create PTY writer: {err}")))?;
-
-            let tx = self.proc_tx.clone();
-            std::thread::spawn(move || {
-                let mut buf = [0_u8; 8192];
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let _ = tx.send(ProcEvent::Output {
-                                tab_id,
-                                bytes: buf[..n].to_vec(),
-                            });
-                        }
-                        Err(err) => {
-                            let _ = tx.send(ProcEvent::Error {
-                                tab_id,
-                                error: err.to_string(),
-                            });
-                            break;
-                        }
-                    }
-                }
-            });
-
-            self.pty_sessions.insert(
+            let session = spawn_pty_session_blocking(
                 tab_id,
-                PtySession {
-                    child,
-                    writer: Arc::new(Mutex::new(writer)),
-                    parser: vt100::Parser::new(45, 180, 10_000),
-                },
-            );
+                terminal.cloned(),
+                context.clone(),
+                self.proc_tx.clone(),
+            )?;
+            self.pty_sessions.insert(tab_id, session);
             Ok(())
         }
 
@@ -1246,6 +1198,7 @@ mod gui {
                 }
             }
 
+            self.poll_ui_events();
             self.flush_pending_auto_send(&had_output);
 
             let mut exited: Vec<(u64, i32)> = Vec::new();
@@ -1287,6 +1240,24 @@ mod gui {
                 self.pipe_sessions.remove(&tab_id);
                 self.pending_sends.remove(&tab_id);
                 let _ = self.proc_tx.send(ProcEvent::Exited { tab_id, code });
+            }
+        }
+
+        fn poll_ui_events(&mut self) {
+            while let Ok(event) = self.ui_rx.try_recv() {
+                match event {
+                    UiEvent::PtyReady { tab_id, session } => {
+                        self.log_info(format!("tab={tab_id} PTY session ready"));
+                        self.pty_sessions.insert(tab_id, session);
+                    }
+                    UiEvent::Error { tab_id, error } => {
+                        self.log_error(format!("tab={tab_id} PTY spawn error: {error}"));
+                        self.connections
+                            .append_line(tab_id, format!("[error] {error}"));
+                        self.connections.set_running(tab_id, false);
+                        self.pending_sends.remove(&tab_id);
+                    }
+                }
             }
         }
 
@@ -1341,6 +1312,10 @@ mod gui {
 
             for (tab_id, pending) in &self.pending_sends {
                 if pending.sent {
+                    continue;
+                }
+                if !self.pty_sessions.contains_key(tab_id) && !self.pipe_sessions.contains_key(tab_id)
+                {
                     continue;
                 }
                 let should_send = had_output.contains(tab_id)
@@ -2305,6 +2280,92 @@ mod gui {
         payload.push(b'\n');
         out.push(payload);
         out
+    }
+
+    fn spawn_pty_session_blocking(
+        tab_id: u64,
+        terminal: Option<TerminalOption>,
+        context: AwsContext,
+        proc_tx: Sender<ProcEvent>,
+    ) -> Result<PtySession> {
+        let (program, args) = shell_plan(terminal.as_ref());
+
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 45,
+                cols: 180,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|err| AppError::Parse(format!("Failed to allocate PTY: {err}")))?;
+
+        let mut cmd = CommandBuilder::new(program);
+        for arg in args {
+            cmd.arg(arg);
+        }
+        cmd.env("AWS_PROFILE", &context.profile);
+        cmd.env("AWS_REGION", &context.region);
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(ref terminal) = terminal {
+                if terminal.kind == TerminalKind::GitBash {
+                    if let Some(updated) = windows_bash_augmented_path(&terminal.program) {
+                        cmd.env("PATH", updated);
+                    }
+                    cmd.env("MSYSTEM", "MSYS");
+                    cmd.env("CHERE_INVOKING", "1");
+                }
+            }
+            let system_root = windows_system_root();
+            let comspec = windows_cmd_path();
+            cmd.env("SystemRoot", &system_root);
+            cmd.env("WINDIR", &system_root);
+            cmd.env("ComSpec", &comspec);
+        }
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|err| AppError::Parse(format!("Failed to spawn PTY shell: {err}")))?;
+        drop(pair.slave);
+
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|err| AppError::Parse(format!("Failed to create PTY reader: {err}")))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|err| AppError::Parse(format!("Failed to create PTY writer: {err}")))?;
+
+        std::thread::spawn(move || {
+            let mut buf = [0_u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let _ = proc_tx.send(ProcEvent::Output {
+                            tab_id,
+                            bytes: buf[..n].to_vec(),
+                        });
+                    }
+                    Err(err) => {
+                        let _ = proc_tx.send(ProcEvent::Error {
+                            tab_id,
+                            error: err.to_string(),
+                        });
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(PtySession {
+            child,
+            writer: Arc::new(Mutex::new(writer)),
+            parser: vt100::Parser::new(45, 180, 10_000),
+        })
     }
 
     #[cfg(test)]
