@@ -97,6 +97,45 @@ test_package_linux_zip_skips_when_no_artifacts() {
   LINUX_DIST_DIR="$original_linux_dist_dir"
 }
 
+test_copy_windows_runtime_dlls_with_custom_gcc() {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  local original_windows_dist_dir="$WINDOWS_DIST_DIR"
+  WINDOWS_DIST_DIR="$tmpdir"
+
+  local bin_dir="$tmpdir/bin"
+  mkdir -p "$bin_dir"
+
+  local fake_gcc="$bin_dir/fake-gcc"
+  cat >"$fake_gcc" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  -print-file-name=libgcc_s_seh-1.dll) echo "$TEST_DLL_DIR/libgcc_s_seh-1.dll" ;;
+  -print-file-name=libstdc++-6.dll) echo "$TEST_DLL_DIR/libstdc++-6.dll" ;;
+  -print-file-name=libwinpthread-1.dll) echo "$TEST_DLL_DIR/libwinpthread-1.dll" ;;
+  *) echo "$1" ;;
+esac
+EOF
+  chmod +x "$fake_gcc"
+
+  local dll_dir="$tmpdir/dlls"
+  mkdir -p "$dll_dir"
+  touch "$dll_dir/libgcc_s_seh-1.dll"
+  touch "$dll_dir/libstdc++-6.dll"
+  touch "$dll_dir/libwinpthread-1.dll"
+
+  TEST_DLL_DIR="$dll_dir" EC2_MANAGER_MINGW_GCC="$fake_gcc" copy_windows_runtime_dlls "x86_64-pc-windows-gnu"
+
+  if [[ ! -f "$WINDOWS_DIST_DIR/libgcc_s_seh-1.dll" || ! -f "$WINDOWS_DIST_DIR/libstdc++-6.dll" || ! -f "$WINDOWS_DIST_DIR/libwinpthread-1.dll" ]]; then
+    echo "assertion failed: windows runtime DLLs were not copied" >&2
+    exit 1
+  fi
+
+  rm -rf "$tmpdir"
+  WINDOWS_DIST_DIR="$original_windows_dist_dir"
+}
+
 main() {
   test_native_mode_uses_host_target_on_linux
   test_windows_mode_target_by_host_os
@@ -104,6 +143,7 @@ main() {
   test_invalid_mode_fails
   test_package_linux_zip_creates_archive_with_artifacts
   test_package_linux_zip_skips_when_no_artifacts
+  test_copy_windows_runtime_dlls_with_custom_gcc
   echo "build_binaries tests passed"
 }
 

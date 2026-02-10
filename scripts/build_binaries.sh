@@ -80,6 +80,21 @@ copy_windows_runtime_dlls() {
     return 0
   fi
 
+  local gcc_cmd="${EC2_MANAGER_MINGW_GCC:-}"
+  if [[ -z "$gcc_cmd" ]]; then
+    if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+      gcc_cmd="x86_64-w64-mingw32-gcc"
+    elif command -v gcc >/dev/null 2>&1; then
+      gcc_cmd="gcc"
+    elif command -v cc >/dev/null 2>&1; then
+      gcc_cmd="cc"
+    else
+      echo "error: unable to locate a mingw gcc to resolve runtime DLLs" >&2
+      echo "hint: ensure mingw-w64 toolchain is installed or set EC2_MANAGER_MINGW_GCC" >&2
+      exit 1
+    fi
+  fi
+
   local dll_names=(
     "libgcc_s_seh-1.dll"
     "libstdc++-6.dll"
@@ -88,11 +103,11 @@ copy_windows_runtime_dlls() {
 
   for dll in "${dll_names[@]}"; do
     local dll_path
-    dll_path="$(x86_64-w64-mingw32-gcc -print-file-name="$dll")"
+    dll_path="$("$gcc_cmd" -print-file-name="$dll")"
 
     if [[ -z "$dll_path" || "$dll_path" == "$dll" || ! -f "$dll_path" ]]; then
       echo "error: unable to locate required Windows runtime DLL: $dll" >&2
-      echo "hint: ensure mingw-w64 is fully installed (sudo apt-get install -y mingw-w64)" >&2
+      echo "hint: ensure mingw-w64 is fully installed or set EC2_MANAGER_MINGW_GCC" >&2
       exit 1
     fi
 
@@ -165,6 +180,7 @@ build_for_target() {
     (cd "$ROOT_DIR" && cargo build --release --features gui --bin "$GUI_APP_NAME")
     copy_artifact "$target" "$GUI_APP_NAME"
     if [[ "$target" == *"windows"* ]]; then
+      copy_windows_runtime_dlls "$target"
       package_windows_zip
     else
       package_linux_zip

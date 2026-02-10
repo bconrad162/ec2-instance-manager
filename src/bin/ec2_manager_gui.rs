@@ -38,7 +38,7 @@ mod gui {
     use ec2_manager::inventory::load_inventory;
     use ec2_manager::models::{
         AuthStatus, AwsContext, DependencyStatus, Instance, Inventory, Mode, SavedFilter,
-        TerminalOption,
+        TerminalKind, TerminalOption,
     };
     use ec2_manager::profile_choice::profile_choice_path;
     use ec2_manager::terminal::{
@@ -219,6 +219,12 @@ mod gui {
     struct PipeSession {
         child: Child,
         stdin: Arc<Mutex<ChildStdin>>,
+    }
+
+    struct PendingSend {
+        payloads: Vec<Vec<u8>>,
+        created_at: Instant,
+        sent: bool,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -458,6 +464,7 @@ mod gui {
         connections: ConnectionTabs,
         pty_sessions: HashMap<u64, PtySession>,
         pipe_sessions: HashMap<u64, PipeSession>,
+        pending_sends: HashMap<u64, PendingSend>,
         proc_tx: Sender<ProcEvent>,
         proc_rx: Receiver<ProcEvent>,
     }
@@ -512,6 +519,7 @@ mod gui {
                 connections: ConnectionTabs::new(),
                 pty_sessions: HashMap::new(),
                 pipe_sessions: HashMap::new(),
+                pending_sends: HashMap::new(),
                 proc_tx,
                 proc_rx,
             };
@@ -600,6 +608,10 @@ mod gui {
 
         fn log_debug(&mut self, message: impl Into<String>) {
             self.log(LogLevel::Debug, message);
+        }
+
+        fn log_trace(&mut self, message: impl Into<String>) {
+            self.log(LogLevel::Trace, message);
         }
 
         fn selected_terminal(&self) -> Option<&TerminalOption> {
@@ -789,10 +801,11 @@ mod gui {
 
             let cmd = build_ssm_session_command(&instance.instance_id, &context.region);
             let command = if context.mode == Mode::Sim {
-                format!(
-                    "echo '[SIM MODE] {cmd}'; echo '[SIM MODE] session open for {}'",
-                    instance.instance_id
-                )
+                let kind = self
+                    .selected_terminal()
+                    .map(|t| t.kind.clone())
+                    .unwrap_or(TerminalKind::Cmd);
+                format_sim_command(kind, &cmd, &instance.instance_id, None)
             } else {
                 cmd
             };
@@ -838,9 +851,15 @@ mod gui {
             );
 
             let command = if context.mode == Mode::Sim {
-                format!(
-                    "echo '[SIM MODE] {cmd}'; echo '[SIM MODE] port-forward {}:{} for {}'",
-                    self.local_port, self.remote_port, instance.instance_id
+                let kind = self
+                    .selected_terminal()
+                    .map(|t| t.kind.clone())
+                    .unwrap_or(TerminalKind::Cmd);
+                format_sim_command(
+                    kind,
+                    &cmd,
+                    &instance.instance_id,
+                    Some((self.local_port, self.remote_port)),
                 )
             } else {
                 cmd
@@ -870,6 +889,14 @@ mod gui {
             context: &AwsContext,
         ) -> Result<()> {
             let selected_terminal = self.selected_terminal().cloned();
+            let bootstrap = terminal_bootstrap(selected_terminal.as_ref());
+            self.log_debug(format!(
+                "terminal selection: {}",
+                terminal_debug_label(selected_terminal.as_ref())
+            ));
+            if let Some(ref cmd) = bootstrap {
+                self.log_debug(format!("terminal bootstrap: {cmd}"));
+            }
             let tab_id = self.connections.open(title.clone(), instance_id.clone());
             self.log_info(format!(
                 "opened connection tab id={tab_id} instance={instance_id}"
@@ -931,10 +958,20 @@ mod gui {
             #[cfg(not(target_os = "windows"))]
             self.spawn_pty_session(tab_id, selected_terminal.as_ref(), context)?;
             if should_auto_send_prefilled_command(self.options.dry_run) {
-                let mut payload = command.into_bytes();
-                payload.push(b'\n');
-                self.send_raw_bytes_to_connection_tab(tab_id, &payload);
-                self.log_info(format!("tab={tab_id} auto-sent prefilled command"));
+                let payloads = build_auto_send_payloads(bootstrap, command);
+                if !payloads.is_empty() {
+                    self.pending_sends.insert(
+                        tab_id,
+                        PendingSend {
+                            payloads,
+                            created_at: Instant::now(),
+                            sent: false,
+                        },
+                    );
+                    self.log_debug(format!(
+                        "tab={tab_id} queued auto-send payloads (deferred)"
+                    ));
+                }
             }
 
             if !self.options.dry_run {
@@ -962,6 +999,11 @@ mod gui {
         ) -> Result<()> {
             let (program, args) = shell_plan(terminal);
             self.log_debug(format!("spawning pipe shell via {program}"));
+            self.log_trace(format!(
+                "pipe shell args: {:?} terminal={}",
+                args,
+                terminal_debug_label(terminal)
+            ));
 
             let mut command = Command::new(program);
             command
@@ -972,6 +1014,9 @@ mod gui {
                 .stderr(Stdio::piped())
                 .stdin(Stdio::piped())
                 .creation_flags(CREATE_NO_WINDOW);
+            if let Ok(path) = std::env::var("PATH") {
+                self.log_trace(format!("pipe PATH len={}", path.len()));
+            }
             let mut child = command
                 .spawn()
                 .map_err(|err| AppError::Parse(format!("Failed to start shell: {err}")))?;
@@ -1051,6 +1096,11 @@ mod gui {
         ) -> Result<()> {
             let (program, args) = shell_plan(terminal);
             self.log_debug(format!("spawning PTY shell via {program}"));
+            self.log_trace(format!(
+                "pty shell args: {:?} terminal={}",
+                args,
+                terminal_debug_label(terminal)
+            ));
 
             let pty_system = native_pty_system();
             let pair = pty_system
@@ -1068,6 +1118,28 @@ mod gui {
             }
             cmd.env("AWS_PROFILE", &context.profile);
             cmd.env("AWS_REGION", &context.region);
+            #[cfg(target_os = "windows")]
+            {
+                if let Some(terminal) = terminal {
+                    if terminal.kind == TerminalKind::GitBash {
+                        if let Some(updated) = windows_bash_augmented_path(&terminal.program) {
+                            self.log_trace(format!("msys PATH len={}", updated.len()));
+                            cmd.env("PATH", updated);
+                        }
+                        cmd.env("MSYSTEM", "MSYS");
+                        cmd.env("CHERE_INVOKING", "1");
+                    }
+                }
+                let system_root = windows_system_root();
+                let comspec = windows_cmd_path();
+                cmd.env("SystemRoot", &system_root);
+                cmd.env("WINDIR", &system_root);
+                cmd.env("ComSpec", &comspec);
+                self.log_trace(format!(
+                    "pty env SystemRoot={} ComSpec={}",
+                    system_root, comspec
+                ));
+            }
 
             let child = pair
                 .slave
@@ -1119,10 +1191,12 @@ mod gui {
         }
 
         fn poll_connection_events(&mut self) {
+            let mut had_output: std::collections::HashSet<u64> = std::collections::HashSet::new();
             while let Ok(event) = self.proc_rx.try_recv() {
                 match event {
                     ProcEvent::Output { tab_id, bytes } => {
                         self.log(LogLevel::Trace, format!("tab={tab_id} output bytes={}", bytes.len()));
+                        had_output.insert(tab_id);
                         if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
                             session.parser.process(&bytes);
                         } else {
@@ -1143,9 +1217,12 @@ mod gui {
                         self.connections
                             .append_line(tab_id, format!("[exit] code={code}"));
                         self.connections.set_running(tab_id, false);
+                        self.pending_sends.remove(&tab_id);
                     }
                 }
             }
+
+            self.flush_pending_auto_send(&had_output);
 
             let mut exited: Vec<(u64, i32)> = Vec::new();
             let mut wait_errors: Vec<String> = Vec::new();
@@ -1184,6 +1261,7 @@ mod gui {
             for (tab_id, code) in exited {
                 self.pty_sessions.remove(&tab_id);
                 self.pipe_sessions.remove(&tab_id);
+                self.pending_sends.remove(&tab_id);
                 let _ = self.proc_tx.send(ProcEvent::Exited { tab_id, code });
             }
         }
@@ -1202,6 +1280,10 @@ mod gui {
         }
 
         fn send_raw_bytes_to_connection_tab(&mut self, tab_id: u64, payload: &[u8]) {
+            self.log_trace(format!(
+                "sending input to tab={tab_id} bytes={}",
+                payload.len()
+            ));
             let mut write_error: Option<String> = None;
             let Some(session) = self.pty_sessions.get(&tab_id) else {
                 if let Some(pipe) = self.pipe_sessions.get(&tab_id) {
@@ -1228,10 +1310,42 @@ mod gui {
             }
         }
 
+        fn flush_pending_auto_send(&mut self, had_output: &std::collections::HashSet<u64>) {
+            const AUTO_SEND_DELAY: Duration = Duration::from_millis(10_000);
+            let now = Instant::now();
+            let mut to_send: Vec<u64> = Vec::new();
+
+            for (tab_id, pending) in &self.pending_sends {
+                if pending.sent {
+                    continue;
+                }
+                let should_send = had_output.contains(tab_id)
+                    || now.duration_since(pending.created_at) >= AUTO_SEND_DELAY;
+                if should_send {
+                    to_send.push(*tab_id);
+                }
+            }
+
+            for tab_id in to_send {
+                if let Some(mut pending) = self.pending_sends.remove(&tab_id) {
+                    for payload in &pending.payloads {
+                        self.send_raw_bytes_to_connection_tab(tab_id, payload);
+                    }
+                    pending.sent = true;
+                    self.log_info(format!("tab={tab_id} auto-sent prefilled command"));
+                }
+            }
+        }
+
         fn forward_terminal_key_input(&mut self, ctx: &egui::Context, tab_id: u64) {
             let events = ctx.input(|i| i.raw.events.clone());
+            let has_text = events.iter().any(|e| matches!(e, egui::Event::Text(_)));
             for event in events {
-                if let Some(payload) = terminal_event_payload(&event) {
+                if let Some(payload) = terminal_event_payload(&event, has_text) {
+                    self.log_trace(format!(
+                        "terminal input event tab={tab_id} kind={}",
+                        terminal_event_kind(&event)
+                    ));
                     self.send_raw_bytes_to_connection_tab(tab_id, &payload);
                 }
             }
@@ -1621,6 +1735,7 @@ mod gui {
                 );
                 if terminal_focus_response.clicked() {
                     terminal_focus_response.request_focus();
+                    self.log_debug(format!("terminal focus requested tab={}", tab.id));
                 }
                 if terminal_focus_response.has_focus() {
                     self.forward_terminal_key_input(ui.ctx(), tab.id);
@@ -2056,21 +2171,27 @@ mod gui {
 
     fn shell_plan(terminal: Option<&TerminalOption>) -> (String, Vec<String>) {
         if cfg!(windows) {
-            let fallback = || ("cmd".to_string(), vec!["/Q".to_string(), "/K".to_string()]);
+            let fallback = || {
+                (
+                    windows_cmd_path(),
+                    vec!["/Q".to_string(), "/K".to_string()],
+                )
+            };
             match terminal.map(|t| t.id.as_str()) {
-                Some("pwsh") => (
+                Some("pwsh") | Some("powershell") | Some("wt") => (
+                    windows_cmd_path(),
+                    vec!["/Q".to_string(), "/K".to_string()],
+                ),
+                Some("git-bash") | Some("msys2-bash") => (
                     terminal
                         .map(|t| t.program.clone())
-                        .unwrap_or_else(|| "pwsh".to_string()),
-                    vec!["-NoExit".to_string()],
+                        .unwrap_or_else(|| "bash".to_string()),
+                    vec!["-i".to_string()],
                 ),
-                Some("powershell") => (
-                    terminal
-                        .map(|t| t.program.clone())
-                        .unwrap_or_else(|| "powershell".to_string()),
-                    vec!["-NoExit".to_string()],
+                Some("cmd") => (
+                    windows_cmd_path(),
+                    vec!["/Q".to_string(), "/K".to_string()],
                 ),
-                Some("cmd") => ("cmd".to_string(), vec!["/Q".to_string(), "/K".to_string()]),
                 Some("wsl") => (
                     terminal
                         .map(|t| t.program.clone())
@@ -2082,6 +2203,90 @@ mod gui {
         } else {
             ("/bin/bash".to_string(), vec!["-i".to_string()])
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_system_root() -> String {
+        std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_cmd_path() -> String {
+        format!("{}\\System32\\cmd.exe", windows_system_root())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn windows_bash_augmented_path(program: &str) -> Option<String> {
+        let program_path = std::path::Path::new(program);
+        let program_dir = program_path.parent()?;
+        let mut parts: Vec<String> = Vec::new();
+
+        parts.push(program_dir.to_string_lossy().to_string());
+
+        let usr_bin = program_dir.join("..").join("usr").join("bin");
+        if usr_bin.is_dir() {
+            parts.push(usr_bin.to_string_lossy().to_string());
+        }
+
+        if let Some(existing) = std::env::var_os("PATH") {
+            parts.push(existing.to_string_lossy().to_string());
+        }
+
+        Some(parts.join(";"))
+    }
+
+    fn format_sim_command(
+        kind: TerminalKind,
+        cmd: &str,
+        instance_id: &str,
+        port_forward: Option<(u16, u16)>,
+    ) -> String {
+        let status_line = if let Some((local, remote)) = port_forward {
+            format!("[SIM MODE] port-forward {local}:{remote} for {instance_id}")
+        } else {
+            format!("[SIM MODE] session open for {instance_id}")
+        };
+
+        if cfg!(windows) {
+            match kind {
+                TerminalKind::Cmd => format!("echo [SIM MODE] {cmd} & echo {status_line}"),
+                TerminalKind::PowerShell7 | TerminalKind::WindowsPowerShell => {
+                    format!("Write-Host '[SIM MODE] {cmd}'; Write-Host '{status_line}'")
+                }
+                _ => format!("echo '[SIM MODE] {cmd}'; echo '{status_line}'"),
+            }
+        } else {
+            format!("echo '[SIM MODE] {cmd}'; echo '{status_line}'")
+        }
+    }
+
+    fn terminal_debug_label(terminal: Option<&TerminalOption>) -> String {
+        terminal
+            .map(|t| format!("id={} name={} kind={:?} program={}", t.id, t.display_name, t.kind, t.program))
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    fn terminal_bootstrap(terminal: Option<&TerminalOption>) -> Option<String> {
+        let terminal = terminal?;
+        match terminal.kind {
+            TerminalKind::PowerShell7 => Some(terminal.program.clone()),
+            TerminalKind::WindowsPowerShell => Some(terminal.program.clone()),
+            TerminalKind::WindowsTerminal => Some("pwsh".to_string()),
+            _ => None,
+        }
+    }
+
+    fn build_auto_send_payloads(bootstrap: Option<String>, command: String) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        if let Some(cmd) = bootstrap {
+            let mut payload = cmd.into_bytes();
+            payload.push(b'\n');
+            out.push(payload);
+        }
+        let mut payload = command.into_bytes();
+        payload.push(b'\n');
+        out.push(payload);
+        out
     }
 
     #[cfg(test)]
@@ -2253,7 +2458,7 @@ mod gui {
             .join("\n")
     }
 
-    fn terminal_event_payload(event: &egui::Event) -> Option<Vec<u8>> {
+    fn terminal_event_payload(event: &egui::Event, has_text: bool) -> Option<Vec<u8>> {
         match event {
             egui::Event::Text(text) => Some(text.as_bytes().to_vec()),
             egui::Event::Paste(text) => Some(text.as_bytes().to_vec()),
@@ -2275,11 +2480,26 @@ mod gui {
                 egui::Key::D if modifiers.ctrl => Some(vec![0x04]),
                 egui::Key::L if modifiers.ctrl => Some(vec![0x0c]),
                 _ if !modifiers.ctrl && !modifiers.command && !modifiers.alt => {
-                    key_ascii_fallback(*key, modifiers.shift).map(|c| vec![c])
+                    if has_text {
+                        None
+                    } else {
+                        key_ascii_fallback(*key, modifiers.shift).map(|c| vec![c])
+                    }
                 }
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    fn terminal_event_kind(event: &egui::Event) -> String {
+        match event {
+            egui::Event::Text(_) => "text".to_string(),
+            egui::Event::Paste(_) => "paste".to_string(),
+            egui::Event::Key { key, .. } => format!("key:{key:?}"),
+            egui::Event::PointerButton { .. } => "pointer_button".to_string(),
+            egui::Event::PointerMoved(_) => "pointer_moved".to_string(),
+            _ => "other".to_string(),
         }
     }
 
@@ -2359,17 +2579,95 @@ mod gui {
 
         #[test]
         #[cfg(windows)]
-        fn shell_plan_falls_back_for_msys2_bash() {
-            let terminal = TerminalOption {
-                id: "msys2-bash".to_string(),
-                display_name: "MSYS2 Bash".to_string(),
-                kind: ec2_manager::models::TerminalKind::GitBash,
-                program: "C:\\msys64\\usr\\bin\\bash.exe".to_string(),
-            };
+        fn windows_cmd_path_is_absolute() {
+            let path = windows_cmd_path();
+            assert!(path.to_ascii_lowercase().ends_with("\\system32\\cmd.exe"));
+        }
 
-            let (prog, args) = shell_plan(Some(&terminal));
-            assert_eq!(prog, "cmd");
-            assert!(args.iter().any(|a| a == "/K"));
+        #[test]
+        #[cfg(windows)]
+        fn format_sim_command_uses_cmd_syntax() {
+            let cmd = format_sim_command(
+                TerminalKind::Cmd,
+                "aws ssm start-session --target i-123 --region us-east-1",
+                "i-123",
+                None,
+            );
+            assert!(cmd.contains("echo [SIM MODE]"));
+            assert!(cmd.contains("& echo [SIM MODE] session open for i-123"));
+        }
+
+        #[test]
+        #[cfg(windows)]
+        fn format_sim_command_uses_powershell_syntax() {
+            let cmd = format_sim_command(
+                TerminalKind::WindowsPowerShell,
+                "aws ssm start-session --target i-123 --region us-east-1",
+                "i-123",
+                None,
+            );
+            assert!(cmd.contains("Write-Host"));
+            assert!(cmd.contains("session open for i-123"));
+        }
+
+        #[test]
+        #[cfg(not(windows))]
+        fn format_sim_command_uses_shell_echo() {
+            let cmd = format_sim_command(
+                TerminalKind::Xterm,
+                "aws ssm start-session --target i-123 --region us-east-1",
+                "i-123",
+                None,
+            );
+            assert!(cmd.contains("echo '[SIM MODE]"));
+            assert!(cmd.contains("session open for i-123"));
+        }
+
+        #[test]
+        fn terminal_debug_label_includes_id() {
+            let terminal = TerminalOption {
+                id: "cmd".to_string(),
+                display_name: "Command Prompt".to_string(),
+                kind: ec2_manager::models::TerminalKind::Cmd,
+                program: "cmd.exe".to_string(),
+            };
+            let label = terminal_debug_label(Some(&terminal));
+            assert!(label.contains("id=cmd"));
+            assert!(label.contains("Command Prompt"));
+        }
+
+        #[test]
+        fn terminal_event_kind_reports_key() {
+            let key = egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            };
+            assert!(terminal_event_kind(&key).starts_with("key:"));
+        }
+
+        #[test]
+        fn terminal_bootstrap_is_none_for_cmd() {
+            let terminal = TerminalOption {
+                id: "cmd".to_string(),
+                display_name: "Command Prompt".to_string(),
+                kind: ec2_manager::models::TerminalKind::Cmd,
+                program: "cmd.exe".to_string(),
+            };
+            assert!(terminal_bootstrap(Some(&terminal)).is_none());
+        }
+
+        #[test]
+        fn build_auto_send_payloads_appends_newlines() {
+            let payloads = build_auto_send_payloads(
+                Some("pwsh".to_string()),
+                "echo hi".to_string(),
+            );
+            assert_eq!(payloads.len(), 2);
+            assert!(payloads[0].ends_with(&[b'\n']));
+            assert!(payloads[1].ends_with(&[b'\n']));
         }
 
         #[test]
@@ -2823,7 +3121,7 @@ mod gui {
                     ..Default::default()
                 },
             };
-            assert_eq!(terminal_event_payload(&ctrl_c), Some(vec![0x03]));
+            assert_eq!(terminal_event_payload(&ctrl_c, false), Some(vec![0x03]));
 
             let enter = egui::Event::Key {
                 key: egui::Key::Enter,
@@ -2832,11 +3130,11 @@ mod gui {
                 repeat: false,
                 modifiers: egui::Modifiers::default(),
             };
-            assert_eq!(terminal_event_payload(&enter), Some(b"\r".to_vec()));
+            assert_eq!(terminal_event_payload(&enter, false), Some(b"\r".to_vec()));
 
             let paste = egui::Event::Paste("echo hi".to_string());
             assert_eq!(
-                terminal_event_payload(&paste),
+                terminal_event_payload(&paste, false),
                 Some("echo hi".as_bytes().to_vec())
             );
         }
@@ -2850,7 +3148,8 @@ mod gui {
                 repeat: false,
                 modifiers: egui::Modifiers::default(),
             };
-            assert_eq!(terminal_event_payload(&key_a), Some(vec![b'a']));
+            assert_eq!(terminal_event_payload(&key_a, false), Some(vec![b'a']));
+            assert_eq!(terminal_event_payload(&key_a, true), None);
 
             let key_a_shift = egui::Event::Key {
                 key: egui::Key::A,
@@ -2862,7 +3161,8 @@ mod gui {
                     ..Default::default()
                 },
             };
-            assert_eq!(terminal_event_payload(&key_a_shift), Some(vec![b'A']));
+            assert_eq!(terminal_event_payload(&key_a_shift, false), Some(vec![b'A']));
+            assert_eq!(terminal_event_payload(&key_a_shift, true), None);
         }
 
         #[test]
