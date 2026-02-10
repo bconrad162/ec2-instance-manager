@@ -614,6 +614,30 @@ mod gui {
             self.log(LogLevel::Trace, message);
         }
 
+        fn guarded_action<F>(&mut self, label: &str, action: F) -> bool
+        where
+            F: FnOnce(&mut Self) -> Result<()>,
+        {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| action(self)));
+            match result {
+                Ok(Ok(())) => true,
+                Ok(Err(err)) => {
+                    self.message = format!("error: {err}");
+                    self.log_error(format!("{label} failed: {err}"));
+                    false
+                }
+                Err(payload) => {
+                    let message = format!(
+                        "{label} panicked: {}",
+                        panic_payload_to_string(payload.as_ref())
+                    );
+                    self.message = message.clone();
+                    self.log_error(message);
+                    false
+                }
+            }
+        }
+
         fn selected_terminal(&self) -> Option<&TerminalOption> {
             self.terminals
                 .iter()
@@ -1644,11 +1668,9 @@ mod gui {
 
                         if let Some(instance_id) = pending_connect {
                             self.selected_instance_id = instance_id;
-                            if let Err(err) = self.connect_selected() {
-                                self.message = format!("error: {err}");
-                                self.log_error(self.message.clone());
+                            if self.guarded_action("quick connect", |app| app.connect_selected()) {
+                                self.main_tab = MainTab::Connections;
                             }
-                            self.main_tab = MainTab::Connections;
                         }
                     });
             });
@@ -2065,9 +2087,8 @@ mod gui {
                     ui.text_edit_singleline(&mut self.selected_instance_id);
 
                     if ui.button("Connect").clicked() {
-                        if let Err(err) = self.connect_selected() {
-                            self.message = format!("error: {err}");
-                            self.log_error(self.message.clone());
+                        if self.guarded_action("connect", |app| app.connect_selected()) {
+                            self.main_tab = MainTab::Connections;
                         }
                     }
 
@@ -2087,10 +2108,7 @@ mod gui {
                         ui.add(egui::DragValue::new(&mut self.remote_port).range(1..=65535));
                     });
                     if ui.button("Port Forward").clicked() {
-                        if let Err(err) = self.port_forward_selected() {
-                            self.message = format!("error: {err}");
-                            self.log_error(self.message.clone());
-                        }
+                        self.guarded_action("port forward", |app| app.port_forward_selected());
                     }
 
                     ui.separator();
@@ -2657,6 +2675,23 @@ mod gui {
                 program: "cmd.exe".to_string(),
             };
             assert!(terminal_bootstrap(Some(&terminal)).is_none());
+        }
+
+        #[test]
+        fn guarded_action_logs_error_on_failure() {
+            let mut app = Ec2GuiApp::new(GuiOptions {
+                mode: Mode::Sim,
+                region: None,
+                dry_run: true,
+            });
+            let ok = app.guarded_action("test-action", |_app| {
+                Err(AppError::Parse("boom".to_string()))
+            });
+            assert!(!ok);
+            assert!(app
+                .logs
+                .iter()
+                .any(|entry| entry.message.contains("test-action failed")));
         }
 
         #[test]
