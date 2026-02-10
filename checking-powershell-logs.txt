@@ -1,0 +1,3 @@
+Get-WinEvent -LogName Application -MaxEvents 20 |
+  Where-Object { $_.Message -match "ec2_manager_gui|ec2_manager" } |
+  Select-Object -First 5 | Format-List
