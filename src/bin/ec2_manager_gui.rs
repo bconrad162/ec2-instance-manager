@@ -26,7 +26,6 @@ mod gui {
     use std::time::{Duration, Instant, SystemTime};
 
     use eframe::egui;
-    #[cfg(not(target_os = "windows"))]
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
     use ec2_manager::aws_context::build_context;
@@ -915,7 +914,20 @@ mod gui {
             }
 
             #[cfg(target_os = "windows")]
-            self.spawn_pipe_session(tab_id, selected_terminal.as_ref(), context)?;
+            {
+                if should_try_pty() {
+                    if let Err(err) =
+                        self.spawn_pty_session(tab_id, selected_terminal.as_ref(), context)
+                    {
+                        self.log_warn(format!(
+                            "PTY session failed on Windows; falling back to pipe mode: {err}"
+                        ));
+                        self.spawn_pipe_session(tab_id, selected_terminal.as_ref(), context)?;
+                    }
+                } else {
+                    self.spawn_pipe_session(tab_id, selected_terminal.as_ref(), context)?;
+                }
+            }
             #[cfg(not(target_os = "windows"))]
             self.spawn_pty_session(tab_id, selected_terminal.as_ref(), context)?;
             if should_auto_send_prefilled_command(self.options.dry_run) {
@@ -1031,7 +1043,6 @@ mod gui {
             Ok(())
         }
 
-        #[cfg(not(target_os = "windows"))]
         fn spawn_pty_session(
             &mut self,
             tab_id: u64,
@@ -2045,26 +2056,28 @@ mod gui {
 
     fn shell_plan(terminal: Option<&TerminalOption>) -> (String, Vec<String>) {
         if cfg!(windows) {
+            let fallback = || ("cmd".to_string(), vec!["/Q".to_string(), "/K".to_string()]);
             match terminal.map(|t| t.id.as_str()) {
-                Some("pwsh") | Some("powershell") | Some("wt") => (
+                Some("pwsh") => (
+                    terminal
+                        .map(|t| t.program.clone())
+                        .unwrap_or_else(|| "pwsh".to_string()),
+                    vec!["-NoExit".to_string()],
+                ),
+                Some("powershell") => (
                     terminal
                         .map(|t| t.program.clone())
                         .unwrap_or_else(|| "powershell".to_string()),
-                    Vec::new(),
+                    vec!["-NoExit".to_string()],
                 ),
-                Some("git-bash") | Some("msys2-bash") => (
-                    terminal
-                        .map(|t| t.program.clone())
-                        .unwrap_or_else(|| "bash".to_string()),
-                    Vec::new(),
-                ),
+                Some("cmd") => ("cmd".to_string(), vec!["/Q".to_string(), "/K".to_string()]),
                 Some("wsl") => (
                     terminal
                         .map(|t| t.program.clone())
                         .unwrap_or_else(|| "wsl".to_string()),
                     vec!["--".to_string(), "bash".to_string()],
                 ),
-                _ => ("cmd".to_string(), vec!["/Q".to_string(), "/K".to_string()]),
+                _ => fallback(),
             }
         } else {
             ("/bin/bash".to_string(), vec!["-i".to_string()])
@@ -2132,6 +2145,15 @@ mod gui {
             "0" | "false" | "no" | "off" => false,
             _ => default,
         }
+    }
+
+    fn should_try_pty_from_env(value: Option<&str>) -> bool {
+        !parse_bool_env(value, false)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn should_try_pty() -> bool {
+        should_try_pty_from_env(std::env::var("EC2_MANAGER_GUI_FORCE_PIPE").ok().as_deref())
     }
 
     fn gui_smoke_config_from_env() -> Option<GuiSmokeConfig> {
@@ -2336,6 +2358,21 @@ mod gui {
         }
 
         #[test]
+        #[cfg(windows)]
+        fn shell_plan_falls_back_for_msys2_bash() {
+            let terminal = TerminalOption {
+                id: "msys2-bash".to_string(),
+                display_name: "MSYS2 Bash".to_string(),
+                kind: ec2_manager::models::TerminalKind::GitBash,
+                program: "C:\\msys64\\usr\\bin\\bash.exe".to_string(),
+            };
+
+            let (prog, args) = shell_plan(Some(&terminal));
+            assert_eq!(prog, "cmd");
+            assert!(args.iter().any(|a| a == "/K"));
+        }
+
+        #[test]
         fn terminate_child_reaps_process() {
             let (program, args) = if cfg!(windows) {
                 (
@@ -2444,36 +2481,59 @@ mod gui {
                     return;
                 }
             }
-            open_result.expect("sim open should spawn PTY session");
+            open_result.expect("sim open should spawn a terminal session");
 
-            // Allow PTY reader thread to publish output and parser to consume it.
             for _ in 0..60 {
                 app.poll_connection_events();
-                let contains_marker = app
+                let pty_has_marker = app
                     .pty_sessions
                     .values()
                     .next()
                     .map(|s| s.parser.screen().contents().contains("terminal-ok"))
                     .unwrap_or(false);
-                if contains_marker {
+                let pipe_has_marker = app
+                    .connections
+                    .selected_ref()
+                    .map(|tab| tab.lines.iter().any(|line| line.contains("terminal-ok")))
+                    .unwrap_or(false);
+                if pty_has_marker || pipe_has_marker {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
 
-            assert_eq!(app.pty_sessions.len(), 1);
-            let parsed = app
-                .pty_sessions
-                .values()
-                .next()
-                .expect("session should exist")
-                .parser
-                .screen()
-                .contents();
-            assert!(
-                parsed.contains("terminal-ok"),
-                "expected PTY buffer to contain echoed marker, got: {parsed}"
-            );
+            if cfg!(windows) {
+                assert!(
+                    !app.pty_sessions.is_empty() || !app.pipe_sessions.is_empty(),
+                    "expected PTY or pipe session on Windows"
+                );
+                let found = app
+                    .pty_sessions
+                    .values()
+                    .next()
+                    .map(|s| s.parser.screen().contents().contains("terminal-ok"))
+                    .unwrap_or(false)
+                    || app
+                        .connections
+                        .selected_ref()
+                        .map(|tab| tab.lines.iter().any(|line| line.contains("terminal-ok")))
+                        .unwrap_or(false);
+                assert!(found, "expected terminal marker in PTY or pipe output");
+            } else {
+                assert_eq!(app.pty_sessions.len(), 1);
+                let parsed = app
+                    .pty_sessions
+                    .values()
+                    .next()
+                    .expect("session should exist")
+                    .parser
+                    .screen()
+                    .contents();
+                assert!(
+                    parsed.contains("terminal-ok"),
+                    "expected PTY buffer to contain echoed marker, got: {parsed}"
+                );
+            }
 
             let tab_id = app
                 .connections
@@ -2697,6 +2757,14 @@ mod gui {
             assert!(!parse_bool_env(Some("off"), true));
             assert!(parse_bool_env(Some("unknown"), true));
             assert!(!parse_bool_env(None, false));
+        }
+
+        #[test]
+        fn should_try_pty_from_env_defaults_to_true_unless_forced() {
+            assert!(should_try_pty_from_env(None));
+            assert!(should_try_pty_from_env(Some("0")));
+            assert!(!should_try_pty_from_env(Some("1")));
+            assert!(!should_try_pty_from_env(Some("true")));
         }
 
         #[test]
