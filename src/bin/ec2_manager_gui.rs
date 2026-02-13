@@ -250,6 +250,15 @@ mod gui {
         args: Vec<String>,
     }
 
+    /// Git-bash-style PS1 prompt sent to the remote shell when the user
+    /// clicks "Update PS1".  Produces:
+    ///   (blank line)
+    ///   user@host SSM ~/working/dir
+    ///   $
+    /// with bold-green user@host, magenta "SSM", and bold-yellow path.
+    const SSM_PS1_COMMAND: &[u8] =
+        b"bash\rexport PS1='\\n\\[\\033[1;32m\\]\\u@\\h\\[\\033[0m\\] \\[\\033[1;35m\\]SSM\\[\\033[0m\\] \\[\\033[1;33m\\]\\w\\[\\033[0m\\]\\n\\$ '\r";
+
     #[derive(Debug, PartialEq, Eq)]
     struct RowAction {
         select: bool,
@@ -1764,13 +1773,18 @@ mod gui {
                 let pty_bytes = self.pty_sessions.get(&tab.id)
                     .map(|s| s.bytes_received)
                     .unwrap_or(0);
-                ui.monospace(format_connection_summary_line(
-                    &tab.title,
-                    &tab.instance_id,
-                    &private_ip,
-                    tab.running,
-                    pty_bytes,
-                ));
+                ui.horizontal(|ui| {
+                    ui.monospace(format_connection_summary_line(
+                        &tab.title,
+                        &tab.instance_id,
+                        &private_ip,
+                        tab.running,
+                        pty_bytes,
+                    ));
+                    if tab.running && ui.small_button("Update PS1").clicked() {
+                        self.send_raw_bytes_to_connection_tab(tab.id, SSM_PS1_COMMAND);
+                    }
+                });
                 ui.separator();
 
                 let show_cursor = ui.input(|i| ((i.time * 2.0) as i64) % 2 == 0);
