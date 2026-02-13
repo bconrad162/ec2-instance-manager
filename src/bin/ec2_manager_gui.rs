@@ -33,7 +33,7 @@ mod gui {
     use ec2_manager::connection_tabs::ConnectionTabs;
     use ec2_manager::diagnostics::run_diagnostics;
     use ec2_manager::error::{AppError, Result};
-    use ec2_manager::filter::{apply_filters, Filters};
+    use ec2_manager::filter::{apply_filters, matching_tags, Filters};
     use ec2_manager::gui_cli::{gui_help_text, parse_gui_args, GuiOptions};
     use ec2_manager::inventory::load_inventory;
     use ec2_manager::models::{
@@ -70,6 +70,7 @@ mod gui {
     const COL_IP_W: f32 = 130.0;
     const COL_ENV_W: f32 = 70.0;
     const COL_APP_W: f32 = 260.0;
+    const COL_TAG_W: f32 = 260.0;
     const STATE_FILTER_NONE: &str = "";
     const STATE_FILTER_RUNNING: &str = "running";
     const STATE_FILTER_STOPPED: &str = "stopped";
@@ -1082,7 +1083,9 @@ mod gui {
                 .stdin(Stdio::piped())
                 .creation_flags(CREATE_NO_WINDOW);
             if let Some(terminal) = terminal {
-                if terminal.kind == TerminalKind::GitBash {
+                if terminal.kind == TerminalKind::GitBash
+                    || terminal.kind == TerminalKind::Msys2
+                {
                     if let Some(updated) = windows_bash_augmented_path(&terminal.program) {
                         command.env("PATH", updated);
                     }
@@ -1101,7 +1104,9 @@ mod gui {
             if program.to_ascii_lowercase().contains("winpty") {
                 self.log_debug("pipe shell uses winpty for Git Bash");
             } else if let Some(terminal) = terminal {
-                if terminal.kind == TerminalKind::GitBash {
+                if terminal.kind == TerminalKind::GitBash
+                    || terminal.kind == TerminalKind::Msys2
+                {
                     self.log_warn(
                         "Git Bash winpty not found; interactive input may be limited".to_string(),
                     );
@@ -1543,11 +1548,16 @@ mod gui {
                             [COL_APP_W, 18.0],
                             egui::Label::new(egui::RichText::new("App/Service").strong()),
                         );
+                        ui.add_sized(
+                            [COL_TAG_W, 18.0],
+                            egui::Label::new(egui::RichText::new("Match Tag").strong()),
+                        );
                         ui.end_row();
 
                         let account_scope = self.account_scope();
                         let region_scope = self.region_scope();
                         let mut pending_connect: Option<String> = None;
+                        let (include_terms, _) = search_terms_from_rules(&self.search_rules);
 
                         for instance in &self.filtered {
                             let is_fav = self.config.is_favorite(
@@ -1639,6 +1649,25 @@ mod gui {
                             row_double_clicked |= resp_app.double_clicked();
                             row_hovered |= resp_app.hovered();
 
+                            let matched_tag_text = if include_terms.is_empty() {
+                                String::new()
+                            } else {
+                                let tags = matching_tags(instance, &include_terms);
+                                let text = tags
+                                    .into_iter()
+                                    .map(|(k, v)| format!("{k}={v}"))
+                                    .collect::<Vec<String>>()
+                                    .join(", ");
+                                truncate(&text, 42)
+                            };
+                            let resp_tag = ui.add_sized(
+                                [COL_TAG_W, 18.0],
+                                egui::Label::new(matched_tag_text).sense(egui::Sense::click()),
+                            );
+                            row_clicked |= resp_tag.clicked();
+                            row_double_clicked |= resp_tag.double_clicked();
+                            row_hovered |= resp_tag.hovered();
+
                             let row_response = resp_fav
                                 .clone()
                                 .union(resp_id.clone())
@@ -1647,7 +1676,8 @@ mod gui {
                                 .union(resp_ssm.clone())
                                 .union(resp_ip.clone())
                                 .union(resp_env.clone())
-                                .union(resp_app.clone());
+                                .union(resp_app.clone())
+                                .union(resp_tag.clone());
 
                             row_response.context_menu(|ui| {
                                 if ui.button("Quick Connect").clicked() {
@@ -1668,7 +1698,8 @@ mod gui {
                                 .union(resp_ssm.rect)
                                 .union(resp_ip.rect)
                                 .union(resp_env.rect)
-                                .union(resp_app.rect);
+                                .union(resp_app.rect)
+                                .union(resp_tag.rect);
 
                             if selected || row_hovered {
                                 let color = if selected {
@@ -1766,7 +1797,8 @@ mod gui {
                 #[cfg(target_os = "windows")]
                 {
                     if let Some(terminal) = self.selected_terminal() {
-                        if terminal.kind == TerminalKind::GitBash
+                        if (terminal.kind == TerminalKind::GitBash
+                            || terminal.kind == TerminalKind::Msys2)
                             && git_bash_winpty_missing(&terminal.program)
                         {
                             ui.colored_label(
@@ -1789,24 +1821,33 @@ mod gui {
 
                 let terminal_response = egui::Frame::none()
                     .fill(terminal_panel_fill())
-                    .inner_margin(egui::Margin::same(8.0))
+                    .inner_margin(egui::Margin::same(0.0))
                     .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        egui::ScrollArea::vertical()
-                            .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                let size = ui.available_size();
-                                ui.add_sized(
-                                    size,
-                                    egui::Label::new(
-                                        egui::RichText::new(terminal_text)
-                                            .monospace()
-                                            .color(terminal_panel_text()),
-                                    )
-                                    .sense(egui::Sense::click()),
-                                )
-                            })
-                            .inner
+                        let available = ui.available_size();
+                        ui.allocate_ui_with_layout(
+                            available,
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_min_width(available.x);
+                                egui::ScrollArea::vertical()
+                                    .auto_shrink([false, false])
+                                    .stick_to_bottom(true)
+                                    .show(ui, |ui| {
+                                        let size = ui.available_size();
+                                        ui.add_sized(
+                                            size,
+                                            egui::Label::new(
+                                                egui::RichText::new(terminal_text)
+                                                    .monospace()
+                                                    .color(terminal_panel_text()),
+                                            )
+                                            .sense(egui::Sense::click()),
+                                        )
+                                    })
+                                    .inner
+                            },
+                        )
+                        .inner
                     });
                 let terminal_focus_id = ui.make_persistent_id(("terminal_focus", tab.id));
                 let terminal_focus_response = ui.interact(
@@ -2259,7 +2300,7 @@ mod gui {
                     windows_cmd_path(),
                     vec!["/Q".to_string(), "/K".to_string()],
                 ),
-                Some("git-bash") | Some("msys2-bash") => {
+                Some("git-bash") => {
                     let terminal = terminal.expect("terminal should be present for bash id");
                     let program = windows_normalize_msys_program_path(&terminal.program);
                     if let Some(winpty) = windows_git_bash_winpty_candidate(&terminal.program)
@@ -2276,6 +2317,11 @@ mod gui {
                     } else {
                         (program, vec!["-i".to_string()])
                     }
+                }
+                Some("msys2-bash") => {
+                    let terminal = terminal.expect("terminal should be present for bash id");
+                    let program = windows_normalize_msys_program_path(&terminal.program);
+                    (program, vec!["-i".to_string()])
                 }
                 Some("cmd") => (
                     windows_cmd_path(),
@@ -2438,6 +2484,7 @@ mod gui {
             TerminalKind::PowerShell7 => Some(terminal.program.clone()),
             TerminalKind::WindowsPowerShell => Some(terminal.program.clone()),
             TerminalKind::WindowsTerminal => Some("pwsh".to_string()),
+            TerminalKind::GitBash | TerminalKind::Msys2 => Some("stty -echoctl; stty erase '^H'".to_string()),
             _ => None,
         }
     }
@@ -2482,7 +2529,9 @@ mod gui {
         #[cfg(target_os = "windows")]
         {
             if let Some(ref terminal) = terminal {
-                if terminal.kind == TerminalKind::GitBash {
+                if terminal.kind == TerminalKind::GitBash
+                    || terminal.kind == TerminalKind::Msys2
+                {
                     if let Some(updated) = windows_bash_augmented_path(&terminal.program) {
                         cmd.env("PATH", updated);
                     }
@@ -2617,7 +2666,9 @@ mod gui {
             return false;
         }
         if let Some(terminal) = terminal {
-            if terminal.kind == TerminalKind::GitBash {
+            if terminal.kind == TerminalKind::GitBash
+                || terminal.kind == TerminalKind::Msys2
+            {
                 return false;
             }
         }
@@ -2750,7 +2801,13 @@ mod gui {
         is_pipe: bool,
     ) -> Option<Vec<u8>> {
         match event {
-            egui::Event::Text(text) => Some(text.as_bytes().to_vec()),
+                egui::Event::Text(text) => {
+                    if text.chars().any(|c| c.is_control()) {
+                        None
+                    } else {
+                        Some(text.as_bytes().to_vec())
+                    }
+                }
             egui::Event::Paste(text) => Some(text.as_bytes().to_vec()),
             egui::Event::Key {
                 key,
@@ -2761,7 +2818,7 @@ mod gui {
                 egui::Key::Enter => Some(b"\r".to_vec()),
                 egui::Key::Backspace => {
                     if is_pipe && *terminal_kind == TerminalKind::GitBash {
-                        Some(vec![0x08, 0x7f])
+                        Some(vec![0x08])
                     } else {
                         Some(vec![0x7f])
                     }
@@ -2879,6 +2936,20 @@ mod gui {
             let (prog, args) = shell_plan(None);
             assert!(!prog.is_empty());
             assert!(!args.is_empty());
+        }
+
+        #[test]
+        fn terminal_bootstrap_for_git_bash_sets_stty() {
+            let terminal = TerminalOption {
+                id: "git-bash".to_string(),
+                display_name: "Git Bash".to_string(),
+                kind: TerminalKind::GitBash,
+                program: "bash".to_string(),
+            };
+            let bootstrap = terminal_bootstrap(Some(&terminal)).unwrap_or_default();
+            assert!(bootstrap.contains("stty -echoctl"));
+            assert!(bootstrap.contains("stty erase"));
+            assert!(bootstrap.contains("^H"));
         }
 
         #[test]
@@ -3656,7 +3727,7 @@ mod gui {
                     &TerminalKind::GitBash,
                     true
                 ),
-                Some(vec![0x08, 0x7f])
+                Some(vec![0x08])
             );
             assert_eq!(
                 terminal_event_payload_for_terminal(
@@ -3666,6 +3737,15 @@ mod gui {
                     false
                 ),
                 Some(vec![0x7f])
+            );
+        }
+
+        #[test]
+        fn terminal_event_payload_ignores_control_text() {
+            let ctrl_text = egui::Event::Text("\u{8}".to_string());
+            assert_eq!(
+                terminal_event_payload_for_terminal(&ctrl_text, false, &TerminalKind::Cmd, false),
+                None
             );
         }
 

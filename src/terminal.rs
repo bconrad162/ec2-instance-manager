@@ -66,7 +66,7 @@ pub fn discover_terminals() -> Vec<TerminalOption> {
                 out.push(TerminalOption {
                     id: "msys2-bash".to_string(),
                     display_name: "MSYS2 Bash".to_string(),
-                    kind: TerminalKind::GitBash,
+                    kind: TerminalKind::Msys2,
                     program: candidate.to_string_lossy().to_string(),
                 });
                 break;
@@ -284,7 +284,7 @@ pub fn build_launch_plan(
             args.push("/k".to_string());
             args.push(session_command.to_string());
         }
-        TerminalKind::GitBash => {
+        TerminalKind::GitBash | TerminalKind::Msys2 => {
             args.push("-lc".to_string());
             args.push(format!("{}; exec bash", session_command));
         }

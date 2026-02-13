@@ -91,6 +91,27 @@ pub fn apply_filters(instances: &[Instance], filters: &Filters) -> Vec<Instance>
         .collect()
 }
 
+pub fn matching_tags(instance: &Instance, terms: &[String]) -> Vec<(String, String)> {
+    let matchers = build_matchers(terms);
+    if matchers.is_empty() {
+        return Vec::new();
+    }
+
+    instance
+        .tags
+        .iter()
+        .filter(|(key, value)| {
+            let mut searchable = String::new();
+            append(&mut searchable, key);
+            append(&mut searchable, value);
+            matchers
+                .iter()
+                .any(|matcher| matcher_matches(matcher, &searchable))
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 fn build_matcher(raw: &str) -> SearchMatcher {
     let query = raw.trim().to_ascii_lowercase();
     if query.is_empty() {
@@ -471,5 +492,33 @@ mod tests {
 
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].instance_id, "i-a");
+    }
+
+    #[test]
+    fn matching_tags_finds_key_or_value_matches() {
+        let mut instance = Instance::new("i-1".to_string(), "running".to_string());
+        instance
+            .tags
+            .insert("Team".to_string(), "cwfm-admin".to_string());
+
+        let by_value = matching_tags(&instance, &vec!["cwfm".to_string()]);
+        assert_eq!(by_value.len(), 1);
+        assert_eq!(by_value[0].0, "Team");
+
+        let by_key = matching_tags(&instance, &vec!["team".to_string()]);
+        assert_eq!(by_key.len(), 1);
+        assert_eq!(by_key[0].1, "cwfm-admin");
+    }
+
+    #[test]
+    fn matching_tags_supports_regex_lite() {
+        let mut instance = Instance::new("i-1".to_string(), "running".to_string());
+        instance
+            .tags
+            .insert("Service".to_string(), "billing-api".to_string());
+
+        let matched = matching_tags(&instance, &vec!["^bill.*$".to_string()]);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].0, "Service");
     }
 }
