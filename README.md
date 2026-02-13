@@ -99,6 +99,27 @@ Requirements in `PATH`:
 - `session-manager-plugin`
 - one supported terminal (`pwsh`, `powershell`, `wt`, `cmd`, `bash`, or `wsl`)
 
+### Windows terminal dependencies (GUI)
+
+The GUI embeds a terminal. The exact requirements depend on which terminal you select:
+
+- `cmd`: No extra install; built into Windows.
+- `powershell`: Windows PowerShell 5.1 is built into Windows.
+- `pwsh`: PowerShell 7 must be installed and `pwsh.exe` must be in `PATH`.
+- `wt`: Windows Terminal must be installed (and `wt.exe` in `PATH`).
+- `bash` (MSYS2/Git Bash): MSYS2 or Git for Windows must be installed.
+  - `bash.exe` must exist (usually `C:\msys64\usr\bin\bash.exe` or `C:\Program Files\Git\bin\bash.exe`).
+  - `winpty.exe` must be installed and located at `<bash>\..\usr\bin\winpty.exe` so the embedded terminal can accept input.
+- Install winpty in MSYS2 (from the MSYS shell) with:
+  - `pacman -S winpty`
+- Install winpty in MSYS2 (from the MINGW64 shell) with:
+  - `pacman -S mingw-w64-x86_64-winpty`
+- `wsl`: WSL must be installed and `wsl.exe` must be in `PATH`.
+
+`winpty` is only required for MSYS2/Git Bash embedded terminals. It is not needed for `cmd`, `powershell`, `pwsh`, or `wt`.
+
+If you select MSYS2/Git Bash without `winpty.exe`, the GUI will warn you and input may not work.
+
 ### Windows setup (binary distribution)
 
 1. Copy the entire `dist/windows/` folder to your Windows laptop.

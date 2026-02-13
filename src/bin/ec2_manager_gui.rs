@@ -210,6 +210,7 @@ mod gui {
         Error { tab_id: u64, error: String },
     }
 
+    #[cfg(target_os = "windows")]
     enum UiEvent {
         PtyReady { tab_id: u64, session: PtySession },
         Error { tab_id: u64, error: String },
@@ -224,6 +225,7 @@ mod gui {
     struct PipeSession {
         child: Child,
         stdin: Arc<Mutex<ChildStdin>>,
+        parser: vt100::Parser,
     }
 
     struct PendingSend {
@@ -472,7 +474,9 @@ mod gui {
         pending_sends: HashMap<u64, PendingSend>,
         proc_tx: Sender<ProcEvent>,
         proc_rx: Receiver<ProcEvent>,
+        #[cfg(target_os = "windows")]
         ui_tx: Sender<UiEvent>,
+        #[cfg(target_os = "windows")]
         ui_rx: Receiver<UiEvent>,
     }
 
@@ -483,6 +487,7 @@ mod gui {
             let config = AppConfig::load().unwrap_or_default();
             let dependencies = dependency_status();
             let (proc_tx, proc_rx) = mpsc::channel();
+            #[cfg(target_os = "windows")]
             let (ui_tx, ui_rx) = mpsc::channel();
             let profile_choice_path = profile_choice_path();
             let last_profile_choice_mtime = profile_choice_mtime(profile_choice_path.as_deref());
@@ -530,7 +535,9 @@ mod gui {
                 pending_sends: HashMap::new(),
                 proc_tx,
                 proc_rx,
+                #[cfg(target_os = "windows")]
                 ui_tx,
+                #[cfg(target_os = "windows")]
                 ui_rx,
             };
 
@@ -976,7 +983,7 @@ mod gui {
 
             #[cfg(target_os = "windows")]
             {
-                if should_try_pty() {
+                if should_try_pty_for_terminal(selected_terminal.as_ref()) {
                     let terminal = selected_terminal.clone();
                     let context = context.clone();
                     let proc_tx = self.proc_tx.clone();
@@ -1006,6 +1013,12 @@ mod gui {
                         let _ = ui_tx.send(event);
                     });
                 } else {
+                    if let Some(terminal) = &selected_terminal {
+                        self.log_debug(format!(
+                            "PTY disabled for terminal kind={:?}; falling back to pipe mode",
+                            terminal.kind
+                        ));
+                    }
                     self.spawn_pipe_session(tab_id, selected_terminal.as_ref(), context)?;
                 }
             }
@@ -1059,7 +1072,7 @@ mod gui {
                 terminal_debug_label(terminal)
             ));
 
-            let mut command = Command::new(program);
+            let mut command = Command::new(&program);
             command
                 .args(args)
                 .env("AWS_PROFILE", &context.profile)
@@ -1068,8 +1081,31 @@ mod gui {
                 .stderr(Stdio::piped())
                 .stdin(Stdio::piped())
                 .creation_flags(CREATE_NO_WINDOW);
+            if let Some(terminal) = terminal {
+                if terminal.kind == TerminalKind::GitBash {
+                    if let Some(updated) = windows_bash_augmented_path(&terminal.program) {
+                        command.env("PATH", updated);
+                    }
+                    command.env("MSYSTEM", "MSYS");
+                    command.env("CHERE_INVOKING", "1");
+                }
+            }
+            let system_root = windows_system_root();
+            let comspec = windows_cmd_path();
+            command.env("SystemRoot", &system_root);
+            command.env("WINDIR", &system_root);
+            command.env("ComSpec", &comspec);
             if let Ok(path) = std::env::var("PATH") {
                 self.log_trace(format!("pipe PATH len={}", path.len()));
+            }
+            if program.to_ascii_lowercase().contains("winpty") {
+                self.log_debug("pipe shell uses winpty for Git Bash");
+            } else if let Some(terminal) = terminal {
+                if terminal.kind == TerminalKind::GitBash {
+                    self.log_warn(
+                        "Git Bash winpty not found; interactive input may be limited".to_string(),
+                    );
+                }
             }
             let mut child = command
                 .spawn()
@@ -1137,6 +1173,7 @@ mod gui {
                 PipeSession {
                     child,
                     stdin: Arc::new(Mutex::new(stdin)),
+                    parser: vt100::Parser::new(45, 180, 10_000),
                 },
             );
             Ok(())
@@ -1174,6 +1211,8 @@ mod gui {
                         self.log(LogLevel::Trace, format!("tab={tab_id} output bytes={}", bytes.len()));
                         had_output.insert(tab_id);
                         if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                            session.parser.process(&bytes);
+                        } else if let Some(session) = self.pipe_sessions.get_mut(&tab_id) {
                             session.parser.process(&bytes);
                         } else {
                             let text = String::from_utf8_lossy(&bytes).to_string();
@@ -1243,6 +1282,7 @@ mod gui {
             }
         }
 
+        #[cfg(target_os = "windows")]
         fn poll_ui_events(&mut self) {
             while let Ok(event) = self.ui_rx.try_recv() {
                 match event {
@@ -1260,6 +1300,9 @@ mod gui {
                 }
             }
         }
+
+        #[cfg(not(target_os = "windows"))]
+        fn poll_ui_events(&mut self) {}
 
         fn close_connection_tab(&mut self, tab_id: u64) {
             if let Some(mut session) = self.pty_sessions.remove(&tab_id) {
@@ -1339,8 +1382,19 @@ mod gui {
         fn forward_terminal_key_input(&mut self, ctx: &egui::Context, tab_id: u64) {
             let events = ctx.input(|i| i.raw.events.clone());
             let has_text = events.iter().any(|e| matches!(e, egui::Event::Text(_)));
+            let terminal_kind = self
+                .selected_terminal()
+                .map(|t| t.kind.clone())
+                .unwrap_or(TerminalKind::Cmd);
+            let is_pipe = self.pipe_sessions.contains_key(&tab_id);
             for event in events {
-                if let Some(payload) = terminal_event_payload(&event, has_text) {
+                if let Some(payload) = terminal_event_payload_for_terminal(
+                    &event,
+                    has_text,
+                    &terminal_kind,
+                    is_pipe,
+                )
+                {
                     self.log_trace(format!(
                         "terminal input event tab={tab_id} kind={}",
                         terminal_event_kind(&event)
@@ -1709,21 +1763,51 @@ mod gui {
                     &private_ip,
                     tab.running,
                 ));
+                #[cfg(target_os = "windows")]
+                {
+                    if let Some(terminal) = self.selected_terminal() {
+                        if terminal.kind == TerminalKind::GitBash
+                            && git_bash_winpty_missing(&terminal.program)
+                        {
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                "Git Bash/MSYS detected but winpty.exe was not found. Embedded terminal input may not work. Install winpty or choose cmd/pwsh.",
+                            );
+                        }
+                    }
+                }
                 ui.separator();
 
                 let show_cursor = ui.input(|i| ((i.time * 2.0) as i64) % 2 == 0);
-                let terminal_text = self
-                    .pty_sessions
-                    .get(&tab.id)
-                    .map(|s| terminal_text_with_cursor(s.parser.screen(), show_cursor))
-                    .unwrap_or_else(|| tab.lines.join("\n"));
+                let terminal_text = if let Some(session) = self.pty_sessions.get(&tab.id) {
+                    terminal_text_with_cursor(session.parser.screen(), show_cursor)
+                } else if let Some(session) = self.pipe_sessions.get(&tab.id) {
+                    pipe_terminal_text(&tab.lines, session.parser.screen(), show_cursor)
+                } else {
+                    tab.lines.join("\n")
+                };
 
-                let terminal_response = egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(terminal_text).monospace())
-                            .sense(egui::Sense::click()),
-                    )
-                });
+                let terminal_response = egui::Frame::none()
+                    .fill(terminal_panel_fill())
+                    .inner_margin(egui::Margin::same(8.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        egui::ScrollArea::vertical()
+                            .stick_to_bottom(true)
+                            .show(ui, |ui| {
+                                let size = ui.available_size();
+                                ui.add_sized(
+                                    size,
+                                    egui::Label::new(
+                                        egui::RichText::new(terminal_text)
+                                            .monospace()
+                                            .color(terminal_panel_text()),
+                                    )
+                                    .sense(egui::Sense::click()),
+                                )
+                            })
+                            .inner
+                    });
                 let terminal_focus_id = ui.make_persistent_id(("terminal_focus", tab.id));
                 let terminal_focus_response = ui.interact(
                     terminal_response.inner.rect,
@@ -2175,12 +2259,24 @@ mod gui {
                     windows_cmd_path(),
                     vec!["/Q".to_string(), "/K".to_string()],
                 ),
-                Some("git-bash") | Some("msys2-bash") => (
-                    terminal
-                        .map(|t| t.program.clone())
-                        .unwrap_or_else(|| "bash".to_string()),
-                    vec!["-i".to_string()],
-                ),
+                Some("git-bash") | Some("msys2-bash") => {
+                    let terminal = terminal.expect("terminal should be present for bash id");
+                    let program = windows_normalize_msys_program_path(&terminal.program);
+                    if let Some(winpty) = windows_git_bash_winpty_candidate(&terminal.program)
+                        .filter(|candidate| candidate.is_file())
+                    {
+                        (
+                            winpty.to_string_lossy().to_string(),
+                            vec![
+                                "-Xallow-non-tty".to_string(),
+                                program,
+                                "-i".to_string(),
+                            ],
+                        )
+                    } else {
+                        (program, vec!["-i".to_string()])
+                    }
+                }
                 Some("cmd") => (
                     windows_cmd_path(),
                     vec!["/Q".to_string(), "/K".to_string()],
@@ -2208,6 +2304,11 @@ mod gui {
         format!("{}\\System32\\cmd.exe", windows_system_root())
     }
 
+    #[cfg(not(target_os = "windows"))]
+    fn windows_cmd_path() -> String {
+        "cmd.exe".to_string()
+    }
+
     #[cfg(target_os = "windows")]
     fn windows_bash_augmented_path(program: &str) -> Option<String> {
         let program_path = std::path::Path::new(program);
@@ -2226,6 +2327,78 @@ mod gui {
         }
 
         Some(parts.join(";"))
+    }
+
+    #[cfg(any(test, target_os = "windows"))]
+    fn windows_git_bash_winpty_candidate(program: &str) -> Option<PathBuf> {
+        let program = windows_normalize_msys_program_path(program);
+        let program_path = std::path::Path::new(&program);
+        if let Some(program_dir) = program_path.parent() {
+            let candidate = program_dir.join("..").join("usr").join("bin").join("winpty.exe");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        let fallback = PathBuf::from(r"C:\msys64\usr\bin\winpty.exe");
+        if fallback.is_file() {
+            return Some(fallback);
+        }
+        None
+    }
+
+    #[cfg(not(any(test, target_os = "windows")))]
+    fn windows_git_bash_winpty_candidate(_program: &str) -> Option<PathBuf> {
+        None
+    }
+
+    #[cfg(any(test, target_os = "windows"))]
+    fn windows_normalize_msys_program_path(program: &str) -> String {
+        if let Some(path) = windows_path_from_msys(program) {
+            path.to_string_lossy().to_string()
+        } else {
+            program.to_string()
+        }
+    }
+
+    #[cfg(not(any(test, target_os = "windows")))]
+    fn windows_normalize_msys_program_path(program: &str) -> String {
+        program.to_string()
+    }
+
+    #[cfg(any(test, target_os = "windows"))]
+    fn windows_path_from_msys(program: &str) -> Option<PathBuf> {
+        if let Some(stripped) = program.strip_prefix('/') {
+            let bytes = stripped.as_bytes();
+            if bytes.len() > 2 && bytes[1] == b'/' && bytes[0].is_ascii_alphabetic() {
+                let drive = (bytes[0] as char).to_ascii_uppercase();
+                let rest = &stripped[2..];
+                let mut windows = String::new();
+                windows.push(drive);
+                windows.push(':');
+                windows.push('\\');
+                windows.push_str(&rest.replace('/', "\\"));
+                return Some(PathBuf::from(windows));
+            }
+            if let Some(root) = std::env::var_os("MSYS2_ROOT") {
+                let mut path = PathBuf::from(root);
+                path.push(stripped.replace('/', "\\"));
+                return Some(path);
+            }
+        }
+        if program.contains("bash.exe") {
+            let fallback = PathBuf::from(r"C:\msys64\usr\bin\bash.exe");
+            if fallback.is_file() {
+                return Some(fallback);
+            }
+        }
+        None
+    }
+
+    #[cfg(any(test, target_os = "windows"))]
+    fn git_bash_winpty_missing(program: &str) -> bool {
+        windows_git_bash_winpty_candidate(program)
+            .map(|candidate| !candidate.is_file())
+            .unwrap_or(true)
     }
 
     fn format_sim_command(
@@ -2431,13 +2604,24 @@ mod gui {
         }
     }
 
+    #[cfg(any(test, target_os = "windows"))]
     fn should_try_pty_from_env(value: Option<&str>) -> bool {
         !parse_bool_env(value, false)
     }
 
-    #[cfg(target_os = "windows")]
-    fn should_try_pty() -> bool {
-        should_try_pty_from_env(std::env::var("EC2_MANAGER_GUI_FORCE_PIPE").ok().as_deref())
+    #[cfg(any(test, target_os = "windows"))]
+    fn should_try_pty_for_terminal(terminal: Option<&TerminalOption>) -> bool {
+        let allow_pty =
+            should_try_pty_from_env(std::env::var("EC2_MANAGER_GUI_FORCE_PIPE").ok().as_deref());
+        if !allow_pty {
+            return false;
+        }
+        if let Some(terminal) = terminal {
+            if terminal.kind == TerminalKind::GitBash {
+                return false;
+            }
+        }
+        true
     }
 
     fn gui_smoke_config_from_env() -> Option<GuiSmokeConfig> {
@@ -2537,7 +2721,34 @@ mod gui {
             .join("\n")
     }
 
-    fn terminal_event_payload(event: &egui::Event, has_text: bool) -> Option<Vec<u8>> {
+    fn pipe_terminal_text(
+        lines: &[String],
+        screen: &vt100::Screen,
+        show_cursor: bool,
+    ) -> String {
+        let mut out = String::new();
+        if !lines.is_empty() {
+            out.push_str(&lines.join("\n"));
+            out.push('\n');
+        }
+        out.push_str(&terminal_text_with_cursor(screen, show_cursor));
+        out
+    }
+
+    fn terminal_panel_fill() -> egui::Color32 {
+        egui::Color32::from_rgb(22, 22, 22)
+    }
+
+    fn terminal_panel_text() -> egui::Color32 {
+        egui::Color32::from_rgb(230, 230, 230)
+    }
+
+    fn terminal_event_payload_for_terminal(
+        event: &egui::Event,
+        has_text: bool,
+        terminal_kind: &TerminalKind,
+        is_pipe: bool,
+    ) -> Option<Vec<u8>> {
         match event {
             egui::Event::Text(text) => Some(text.as_bytes().to_vec()),
             egui::Event::Paste(text) => Some(text.as_bytes().to_vec()),
@@ -2548,16 +2759,30 @@ mod gui {
                 ..
             } => match key {
                 egui::Key::Enter => Some(b"\r".to_vec()),
-                egui::Key::Backspace => Some(vec![0x7f]),
+                egui::Key::Backspace => {
+                    if is_pipe && *terminal_kind == TerminalKind::GitBash {
+                        Some(vec![0x08, 0x7f])
+                    } else {
+                        Some(vec![0x7f])
+                    }
+                }
                 egui::Key::Tab => Some(b"\t".to_vec()),
                 egui::Key::Escape => Some(vec![0x1b]),
                 egui::Key::ArrowUp => Some(b"\x1b[A".to_vec()),
                 egui::Key::ArrowDown => Some(b"\x1b[B".to_vec()),
                 egui::Key::ArrowRight => Some(b"\x1b[C".to_vec()),
                 egui::Key::ArrowLeft => Some(b"\x1b[D".to_vec()),
-                egui::Key::C if modifiers.ctrl => Some(vec![0x03]),
+                egui::Key::C if modifiers.ctrl => {
+                    if is_pipe && *terminal_kind == TerminalKind::GitBash {
+                        Some(vec![0x03, b'\r'])
+                    } else {
+                        Some(vec![0x03])
+                    }
+                },
                 egui::Key::D if modifiers.ctrl => Some(vec![0x04]),
                 egui::Key::L if modifiers.ctrl => Some(vec![0x0c]),
+                egui::Key::U if modifiers.ctrl => Some(vec![0x15]),
+                egui::Key::W if modifiers.ctrl => Some(vec![0x17]),
                 _ if !modifiers.ctrl && !modifiers.command && !modifiers.alt => {
                     if has_text {
                         None
@@ -2657,10 +2882,112 @@ mod gui {
         }
 
         #[test]
+        fn should_try_pty_for_terminal_prefers_pipe_for_git_bash() {
+            std::env::remove_var("EC2_MANAGER_GUI_FORCE_PIPE");
+            let terminal = TerminalOption {
+                id: "git-bash".to_string(),
+                display_name: "Git Bash".to_string(),
+                kind: TerminalKind::GitBash,
+                program: "bash".to_string(),
+            };
+            assert!(!should_try_pty_for_terminal(Some(&terminal)));
+        }
+
+        #[test]
+        fn should_try_pty_for_terminal_allows_cmd_when_not_forced() {
+            std::env::remove_var("EC2_MANAGER_GUI_FORCE_PIPE");
+            let terminal = TerminalOption {
+                id: "cmd".to_string(),
+                display_name: "Command Prompt".to_string(),
+                kind: TerminalKind::Cmd,
+                program: "cmd.exe".to_string(),
+            };
+            assert!(should_try_pty_for_terminal(Some(&terminal)));
+        }
+
+        #[test]
+        fn git_bash_winpty_candidate_uses_usr_bin() {
+            let program = if cfg!(windows) {
+                "C:\\msys64\\usr\\bin\\bash.exe"
+            } else {
+                "/c/msys64/usr/bin/bash.exe"
+            };
+            let candidate = windows_git_bash_winpty_candidate(program).unwrap();
+            let path = candidate.to_string_lossy().to_string();
+            if cfg!(windows) {
+                assert!(path.ends_with("\\usr\\bin\\winpty.exe"));
+            } else {
+                assert!(path.ends_with("/usr/bin/winpty.exe"));
+            }
+        }
+
+        #[test]
+        fn windows_path_from_msys_drive_letter() {
+            let path = windows_path_from_msys("/c/msys64/usr/bin/bash.exe").unwrap();
+            assert_eq!(path.to_string_lossy(), "C:\\msys64\\usr\\bin\\bash.exe");
+        }
+
+        #[test]
+        fn windows_path_from_msys_root_env() {
+            let prev = std::env::var_os("MSYS2_ROOT");
+            std::env::set_var("MSYS2_ROOT", r"C:\msys64");
+            let path = windows_path_from_msys("/usr/bin/bash.exe").unwrap();
+            assert_eq!(path.to_string_lossy(), "C:\\msys64\\usr\\bin\\bash.exe");
+            if let Some(prev) = prev {
+                std::env::set_var("MSYS2_ROOT", prev);
+            } else {
+                std::env::remove_var("MSYS2_ROOT");
+            }
+        }
+
+        #[test]
+        fn windows_path_from_msys_fallback_uses_msys64() {
+            let fallback = PathBuf::from(r"C:\msys64\usr\bin\bash.exe");
+            if !fallback.is_file() {
+                return;
+            }
+            let path = windows_path_from_msys("bash.exe").unwrap();
+            assert_eq!(path.to_string_lossy(), "C:\\msys64\\usr\\bin\\bash.exe");
+        }
+
+        #[test]
+        fn git_bash_winpty_missing_returns_true_when_absent() {
+            let program = if cfg!(windows) {
+                "C:\\msys64\\usr\\bin\\bash.exe"
+            } else {
+                "/c/msys64/usr/bin/bash.exe"
+            };
+            assert!(git_bash_winpty_missing(program));
+        }
+
+        #[test]
+        fn git_bash_winpty_missing_returns_false_when_present() {
+            let root = std::env::temp_dir().join("ec2_manager_winpty_test");
+            let program_dir = root.join("usr").join("bin");
+            let program = program_dir.join("bash.exe");
+            let winpty = program_dir.join("winpty.exe");
+            let _ = std::fs::create_dir_all(&program_dir);
+            let _ = std::fs::write(&program, b"");
+            let _ = std::fs::write(&winpty, b"");
+            let result = git_bash_winpty_missing(program.to_string_lossy().as_ref());
+            let _ = std::fs::remove_file(&program);
+            let _ = std::fs::remove_file(&winpty);
+            let _ = std::fs::remove_dir_all(&root);
+            assert!(!result);
+        }
+
+        #[test]
         #[cfg(windows)]
         fn windows_cmd_path_is_absolute() {
             let path = windows_cmd_path();
             assert!(path.to_ascii_lowercase().ends_with("\\system32\\cmd.exe"));
+        }
+
+        #[test]
+        #[cfg(not(windows))]
+        fn windows_cmd_path_stub_has_cmd_name() {
+            let path = windows_cmd_path();
+            assert!(path.to_ascii_lowercase().contains("cmd"));
         }
 
         #[test]
@@ -3217,7 +3544,14 @@ mod gui {
                     ..Default::default()
                 },
             };
-            assert_eq!(terminal_event_payload(&ctrl_c, false), Some(vec![0x03]));
+            assert_eq!(
+                terminal_event_payload_for_terminal(&ctrl_c, false, &TerminalKind::Cmd, false),
+                Some(vec![0x03])
+            );
+            assert_eq!(
+                terminal_event_payload_for_terminal(&ctrl_c, false, &TerminalKind::GitBash, true),
+                Some(vec![0x03, b'\r'])
+            );
 
             let enter = egui::Event::Key {
                 key: egui::Key::Enter,
@@ -3226,11 +3560,44 @@ mod gui {
                 repeat: false,
                 modifiers: egui::Modifiers::default(),
             };
-            assert_eq!(terminal_event_payload(&enter, false), Some(b"\r".to_vec()));
+            assert_eq!(
+                terminal_event_payload_for_terminal(&enter, false, &TerminalKind::Cmd, false),
+                Some(b"\r".to_vec())
+            );
+
+            let ctrl_w = egui::Event::Key {
+                key: egui::Key::W,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            };
+            assert_eq!(
+                terminal_event_payload_for_terminal(&ctrl_w, false, &TerminalKind::Cmd, false),
+                Some(vec![0x17])
+            );
+
+            let ctrl_u = egui::Event::Key {
+                key: egui::Key::U,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            };
+            assert_eq!(
+                terminal_event_payload_for_terminal(&ctrl_u, false, &TerminalKind::Cmd, false),
+                Some(vec![0x15])
+            );
 
             let paste = egui::Event::Paste("echo hi".to_string());
             assert_eq!(
-                terminal_event_payload(&paste, false),
+                terminal_event_payload_for_terminal(&paste, false, &TerminalKind::Cmd, false),
                 Some("echo hi".as_bytes().to_vec())
             );
         }
@@ -3244,8 +3611,14 @@ mod gui {
                 repeat: false,
                 modifiers: egui::Modifiers::default(),
             };
-            assert_eq!(terminal_event_payload(&key_a, false), Some(vec![b'a']));
-            assert_eq!(terminal_event_payload(&key_a, true), None);
+            assert_eq!(
+                terminal_event_payload_for_terminal(&key_a, false, &TerminalKind::Cmd, false),
+                Some(vec![b'a'])
+            );
+            assert_eq!(
+                terminal_event_payload_for_terminal(&key_a, true, &TerminalKind::Cmd, false),
+                None
+            );
 
             let key_a_shift = egui::Event::Key {
                 key: egui::Key::A,
@@ -3257,8 +3630,51 @@ mod gui {
                     ..Default::default()
                 },
             };
-            assert_eq!(terminal_event_payload(&key_a_shift, false), Some(vec![b'A']));
-            assert_eq!(terminal_event_payload(&key_a_shift, true), None);
+            assert_eq!(
+                terminal_event_payload_for_terminal(&key_a_shift, false, &TerminalKind::Cmd, false),
+                Some(vec![b'A'])
+            );
+            assert_eq!(
+                terminal_event_payload_for_terminal(&key_a_shift, true, &TerminalKind::Cmd, false),
+                None
+            );
+        }
+
+        #[test]
+        fn terminal_event_payload_uses_git_bash_backspace_on_pipe() {
+            let backspace = egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            };
+            assert_eq!(
+                terminal_event_payload_for_terminal(
+                    &backspace,
+                    false,
+                    &TerminalKind::GitBash,
+                    true
+                ),
+                Some(vec![0x08, 0x7f])
+            );
+            assert_eq!(
+                terminal_event_payload_for_terminal(
+                    &backspace,
+                    false,
+                    &TerminalKind::GitBash,
+                    false
+                ),
+                Some(vec![0x7f])
+            );
+        }
+
+        #[test]
+        fn terminal_panel_text_is_light() {
+            let text = terminal_panel_text();
+            assert!(text.r() >= 200);
+            assert!(text.g() >= 200);
+            assert!(text.b() >= 200);
         }
 
         #[test]
@@ -3275,6 +3691,25 @@ mod gui {
             parser.process(b"abc");
             let text = terminal_text_with_cursor(parser.screen(), false);
             assert!(!text.lines().next().unwrap_or_default().contains('|'));
+        }
+
+        #[test]
+        fn pipe_terminal_text_includes_header_and_output() {
+            let mut parser = vt100::Parser::new(3, 20, 100);
+            parser.process(b"hello");
+            let lines = vec!["$ cmd".to_string(), "profile=demo".to_string()];
+            let text = pipe_terminal_text(&lines, parser.screen(), false);
+            assert!(text.contains("$ cmd"));
+            assert!(text.contains("profile=demo"));
+            assert!(text.contains("hello"));
+        }
+
+        #[test]
+        fn terminal_panel_fill_is_dark() {
+            let fill = terminal_panel_fill();
+            assert!(fill.r() <= 20);
+            assert!(fill.g() <= 20);
+            assert!(fill.b() <= 20);
         }
     }
 }
