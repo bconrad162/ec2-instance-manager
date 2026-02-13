@@ -31,13 +31,8 @@ if [[ "$help_text" != *"--smoke-wait-seconds"* ]]; then
   exit 1
 fi
 
-if [[ "$help_text" != *"--msys2-bash-path"* ]]; then
-  echo "assertion failed: help output should mention --msys2-bash-path" >&2
-  exit 1
-fi
-
-if [[ "$help_text" != *"MSYS2 terminal only"* ]]; then
-  echo "assertion failed: help output should mention MSYS2-only behavior" >&2
+if [[ "$help_text" != *"PowerShell"* ]]; then
+  echo "assertion failed: help output should mention PowerShell" >&2
   exit 1
 fi
 

@@ -66,52 +66,66 @@ pub fn load_inventory(
 }
 
 fn load_live_inventory(context: &AwsContext, mapping: &TagMapping) -> Result<Inventory> {
-    let profile = context.profile.as_str();
-    let region = context.region.as_str();
+    let profile = context.profile.to_string();
+    let region = context.region.to_string();
 
-    let basics_output = run_aws_cli(
-        Some(profile),
-        Some(region),
-        &[
-            "ec2",
-            "describe-instances",
-            "--output",
-            "text",
-            "--query",
-            "Reservations[].Instances[].[InstanceId,State.Name,PrivateIpAddress,Placement.AvailabilityZone,InstanceType,LaunchTime]",
-        ],
-    )?;
+    let p1 = profile.clone();
+    let r1 = region.clone();
+    let basics_handle = std::thread::spawn(move || {
+        run_aws_cli(
+            Some(&p1),
+            Some(&r1),
+            &[
+                "ec2",
+                "describe-instances",
+                "--output",
+                "text",
+                "--query",
+                "Reservations[].Instances[].[InstanceId,State.Name,PrivateIpAddress,Placement.AvailabilityZone,InstanceType,LaunchTime]",
+            ],
+        )
+    });
+
+    let p2 = profile.clone();
+    let r2 = region.clone();
+    let tags_handle = std::thread::spawn(move || {
+        run_aws_cli(
+            Some(&p2),
+            Some(&r2),
+            &[
+                "ec2",
+                "describe-tags",
+                "--output",
+                "text",
+                "--query",
+                "Tags[].[ResourceId,Key,Value]",
+            ],
+        )
+    });
+
+    let p3 = profile.clone();
+    let r3 = region.clone();
+    let ssm_handle = std::thread::spawn(move || {
+        run_aws_cli(
+            Some(&p3),
+            Some(&r3),
+            &[
+                "ssm",
+                "describe-instance-information",
+                "--output",
+                "text",
+                "--query",
+                "InstanceInformationList[].[InstanceId,PingStatus,LastPingDateTime]",
+            ],
+        )
+    });
+
+    let basics_output = basics_handle.join().expect("basics thread panicked")?;
+    let tags_output = tags_handle.join().expect("tags thread panicked")?;
+    let ssm_output = ssm_handle.join().expect("ssm thread panicked")?;
 
     let mut instances = parse_instance_basics(&basics_output)?;
-
-    let tags_output = run_aws_cli(
-        Some(profile),
-        Some(region),
-        &[
-            "ec2",
-            "describe-tags",
-            "--output",
-            "text",
-            "--query",
-            "Tags[].[ResourceId,Key,Value]",
-        ],
-    )?;
-
     apply_tags(&mut instances, &tags_output);
-
-    let ssm_output = run_aws_cli(
-        Some(profile),
-        Some(region),
-        &[
-            "ssm",
-            "describe-instance-information",
-            "--output",
-            "text",
-            "--query",
-            "InstanceInformationList[].[InstanceId,PingStatus,LastPingDateTime]",
-        ],
-    )?;
-
     apply_ssm_status(&mut instances, &ssm_output);
     derive_fields(&mut instances, mapping);
 

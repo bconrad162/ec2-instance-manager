@@ -8,6 +8,6 @@ default = []
 gui = ["dep:eframe", "dep:portable-pty", "dep:vt100"]
 
 [dependencies]
-eframe = { version = "0.30", optional = true }
-portable-pty = { version = "0.8", optional = true }
-vt100 = { version = "0.15", optional = true }
+eframe = { version = "0.33.3", optional = true }
+portable-pty = { version = "0.9", optional = true }
+vt100 = { version = "0.16.2", optional = true }

@@ -97,28 +97,15 @@ Requirements in `PATH`:
 
 - `aws`
 - `session-manager-plugin`
-- one supported terminal (`pwsh`, `powershell`, `wt`, `cmd`, `bash`, or `wsl`)
+- one supported terminal (`pwsh`, `powershell`, `wt`, `cmd`, or `wsl`)
 
 ### Windows terminal dependencies (GUI)
 
-The GUI embeds a terminal. The exact requirements depend on which terminal you select:
+The GUI embeds a terminal via ConPTY. Supported embedded shells on Windows:
 
 - `cmd`: No extra install; built into Windows.
 - `powershell`: Windows PowerShell 5.1 is built into Windows.
 - `pwsh`: PowerShell 7 must be installed and `pwsh.exe` must be in `PATH`.
-- `wt`: Windows Terminal must be installed (and `wt.exe` in `PATH`).
-- `bash` (MSYS2/Git Bash): MSYS2 or Git for Windows must be installed.
-  - `bash.exe` must exist (usually `C:\msys64\usr\bin\bash.exe` or `C:\Program Files\Git\bin\bash.exe`).
-  - `winpty.exe` must be installed and located at `<bash>\..\usr\bin\winpty.exe` so the embedded terminal can accept input.
-- Install winpty in MSYS2 (from the MSYS shell) with:
-  - `pacman -S winpty`
-- Install winpty in MSYS2 (from the MINGW64 shell) with:
-  - `pacman -S mingw-w64-x86_64-winpty`
-- `wsl`: WSL must be installed and `wsl.exe` must be in `PATH`.
-
-`winpty` is only required for MSYS2/Git Bash embedded terminals. It is not needed for `cmd`, `powershell`, `pwsh`, or `wt`.
-
-If you select MSYS2/Git Bash without `winpty.exe`, the GUI will warn you and input may not work.
 
 ### Windows setup (binary distribution)
 
@@ -218,16 +205,10 @@ Helper script tests:
 ./scripts/test_run_windows_vm_test.sh
 ```
 
-Automated Windows in-guest GUI terminal smoke test (MSYS2 terminal only; uses `/oem/install.bat` hook and shared result marker):
+Automated Windows in-guest GUI terminal smoke test (PowerShell; uses `/oem/install.bat` hook and shared result marker):
 
 ```bash
 ./scripts/run_windows_gui_smoke_test.sh
-```
-
-If MSYS2 is installed in a non-default location, override detection path:
-
-```bash
-./scripts/run_windows_gui_smoke_test.sh --msys2-bash-path 'C:\custom\msys64\usr\bin\bash.exe'
 ```
 
 Related smoke harness checks:

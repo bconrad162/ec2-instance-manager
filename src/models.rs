@@ -132,8 +132,6 @@ pub enum TerminalKind {
     PowerShell7,
     WindowsPowerShell,
     WindowsTerminal,
-    GitBash,
-    Msys2,
     Cmd,
     Wsl,
     CosmicTerm,

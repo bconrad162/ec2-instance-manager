@@ -11,13 +11,12 @@ MARKER_FILE="${SHARE_DIR}/windows_gui_smoke_marker.txt"
 WEB_URL="http://localhost:8016"
 VM_WAIT_SECONDS=600
 SMOKE_WAIT_SECONDS=1200
-MSYS2_BASH_PATH='C:\msys64\usr\bin\bash.exe'
 
 usage() {
   cat <<USAGE
-Usage: $0 [--skip-build] [--skip-host-gui-terminal-tests] [--reuse-storage] [--keep-running] [--vm-wait-seconds N] [--smoke-wait-seconds N] [--msys2-bash-path PATH]
+Usage: $0 [--skip-build] [--skip-host-gui-terminal-tests] [--reuse-storage] [--keep-running] [--vm-wait-seconds N] [--smoke-wait-seconds N]
 
-Build Windows artifacts, run host-side GUI terminal validation, boot Windows VM smoke stack, and assert in-guest GUI terminal smoke marker using MSYS2 terminal only.
+Build Windows artifacts, run host-side GUI terminal validation, boot Windows VM smoke stack, and assert in-guest GUI terminal smoke marker using PowerShell.
 
 Options:
   --skip-build                    Do not run Windows build step (expects dist/windows artifacts to exist)
@@ -26,7 +25,6 @@ Options:
   --keep-running                  Leave VM stack running after script exits
   --vm-wait-seconds N             Timeout for VM web readiness (default: 600)
   --smoke-wait-seconds N          Timeout for in-guest smoke result file (default: 1200)
-  --msys2-bash-path PATH          Preferred Windows MSYS2 bash.exe path (default: C:\msys64\usr\bin\bash.exe)
   -h, --help                      Show help
 USAGE
 }
@@ -112,12 +110,6 @@ $workingDir = Split-Path -Parent $exePath
 $appDataDir = Join-Path $sharePath "appdata"
 $configDir = Join-Path $appDataDir "ec2-manager"
 $configPath = Join-Path $configDir "config.ini"
-$msys2Candidates = @(
-  "__MSYS2_BASH_PATH__"
-  "C:\msys64\usr\bin\bash.exe"
-  "C:\tools\msys64\usr\bin\bash.exe"
-) | Select-Object -Unique
-$msys2Bash = $msys2Candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 for ($i = 0; $i -lt 120; $i++) {
   if (Test-Path $sharePath) { break }
@@ -133,19 +125,12 @@ if (-not (Test-Path $exePath)) {
   exit 1
 }
 
-if (-not $msys2Bash) {
-  Set-Content -Path $resultFile -Value "FAIL:msys2-not-found" -Encoding Ascii -Force
-  exit 1
-}
-
 Remove-Item -Path $markerFile -ErrorAction SilentlyContinue
 Remove-Item -Path $resultFile -ErrorAction SilentlyContinue
 
-$msys2Root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $msys2Bash))
 New-Item -ItemType Directory -Path $configDir -Force | Out-Null
-Set-Content -Path $configPath -Value "default_mode=sim`ndefault_terminal=msys2-bash`n" -Encoding Ascii -Force
+Set-Content -Path $configPath -Value "default_mode=sim`ndefault_terminal=powershell`n" -Encoding Ascii -Force
 $env:APPDATA = $appDataDir
-$env:MSYS2_ROOT = $msys2Root
 
 $env:EC2_MANAGER_GUI_SMOKE_MARKER = $markerFile
 $env:EC2_MANAGER_GUI_SMOKE_EXPECTED_TEXT = "[SIM MODE] session open for"
@@ -157,7 +142,7 @@ $deadline = (Get-Date).AddSeconds(240)
 
 while ((Get-Date) -lt $deadline) {
   if (Test-Path $markerFile) {
-    Set-Content -Path $resultFile -Value "PASS`nterminal=msys2-bash`nmsys2_bash=$msys2Bash" -Encoding Ascii -Force
+    Set-Content -Path $resultFile -Value "PASS`nterminal=powershell" -Encoding Ascii -Force
     if (-not $proc.HasExited) {
       Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
@@ -177,11 +162,6 @@ if (-not $proc.HasExited) {
 }
 exit 1
 PS1
-
-  local escaped_msys2_path
-  escaped_msys2_path="${MSYS2_BASH_PATH//\\/\\\\}"
-  escaped_msys2_path="${escaped_msys2_path//&/\\&}"
-  sed -i "s|__MSYS2_BASH_PATH__|${escaped_msys2_path}|g" "${OEM_DIR}/windows_gui_smoke.ps1"
 }
 
 wait_for_web_ready() {
@@ -244,14 +224,6 @@ main() {
         SMOKE_WAIT_SECONDS="${2:-}"
         if [[ -z "$SMOKE_WAIT_SECONDS" || ! "$SMOKE_WAIT_SECONDS" =~ ^[0-9]+$ ]]; then
           echo "error: --smoke-wait-seconds requires a positive integer" >&2
-          exit 1
-        fi
-        shift 2
-        ;;
-      --msys2-bash-path)
-        MSYS2_BASH_PATH="${2:-}"
-        if [[ -z "$MSYS2_BASH_PATH" ]]; then
-          echo "error: --msys2-bash-path requires a value" >&2
           exit 1
         fi
         shift 2

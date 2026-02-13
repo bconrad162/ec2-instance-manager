@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::process::Command;
 
 use crate::config::AppConfig;
@@ -56,41 +55,12 @@ pub fn discover_terminals() -> Vec<TerminalOption> {
         );
         push_if_found(
             &mut out,
-            "git-bash",
-            "Git Bash",
-            TerminalKind::GitBash,
-            &["bash.exe"],
-        );
-        for candidate in windows_msys2_bash_candidates() {
-            if candidate.is_file() && !out.iter().any(|t| t.id == "msys2-bash") {
-                out.push(TerminalOption {
-                    id: "msys2-bash".to_string(),
-                    display_name: "MSYS2 Bash".to_string(),
-                    kind: TerminalKind::Msys2,
-                    program: candidate.to_string_lossy().to_string(),
-                });
-                break;
-            }
-        }
-        push_if_found(
-            &mut out,
             "cmd",
             "Command Prompt",
             TerminalKind::Cmd,
             &["cmd.exe"],
         );
         push_if_found(&mut out, "wsl", "WSL", TerminalKind::Wsl, &["wsl.exe"]);
-
-        for candidate in windows_git_bash_candidates() {
-            if candidate.is_file() && !out.iter().any(|t| t.id == "git-bash") {
-                out.push(TerminalOption {
-                    id: "git-bash".to_string(),
-                    display_name: "Git Bash".to_string(),
-                    kind: TerminalKind::GitBash,
-                    program: candidate.to_string_lossy().to_string(),
-                });
-            }
-        }
     } else {
         push_if_found(
             &mut out,
@@ -147,52 +117,6 @@ fn push_if_found(
     }
 }
 
-fn windows_git_bash_candidates() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-
-    if let Some(program_files) = std::env::var_os("ProgramFiles") {
-        out.push(
-            PathBuf::from(&program_files)
-                .join("Git")
-                .join("bin")
-                .join("bash.exe"),
-        );
-    }
-    if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
-        out.push(
-            PathBuf::from(&program_files_x86)
-                .join("Git")
-                .join("bin")
-                .join("bash.exe"),
-        );
-    }
-
-    out
-}
-
-fn windows_msys2_bash_candidates() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-
-    if let Some(root) = std::env::var_os("MSYS2_ROOT") {
-        out.push(PathBuf::from(root).join("usr").join("bin").join("bash.exe"));
-    }
-
-    out.push(
-        PathBuf::from(r"C:\msys64")
-            .join("usr")
-            .join("bin")
-            .join("bash.exe"),
-    );
-    out.push(
-        PathBuf::from(r"C:\tools\msys64")
-            .join("usr")
-            .join("bin")
-            .join("bash.exe"),
-    );
-
-    out
-}
-
 pub fn pick_default_terminal(
     config: &AppConfig,
     terminals: &[TerminalOption],
@@ -209,8 +133,6 @@ pub fn pick_default_terminal(
             "powershell",
             "wt",
             "cmd",
-            "msys2-bash",
-            "git-bash",
             "wsl",
         ]
     } else {
@@ -233,8 +155,44 @@ pub fn pick_default_terminal(
     terminals.first().cloned()
 }
 
+pub fn build_ssm_session_args(instance_id: &str, region: &str) -> Vec<String> {
+    vec![
+        "ssm".to_string(),
+        "start-session".to_string(),
+        "--target".to_string(),
+        instance_id.to_string(),
+        "--region".to_string(),
+        region.to_string(),
+    ]
+}
+
+pub fn build_ssm_port_forward_args(
+    instance_id: &str,
+    region: &str,
+    local_port: u16,
+    remote_port: u16,
+) -> Vec<String> {
+    vec![
+        "ssm".to_string(),
+        "start-session".to_string(),
+        "--target".to_string(),
+        instance_id.to_string(),
+        "--region".to_string(),
+        region.to_string(),
+        "--document-name".to_string(),
+        "AWS-StartPortForwardingSession".to_string(),
+        "--parameters".to_string(),
+        format!(
+            "localPortNumber={local_port},portNumber={remote_port}"
+        ),
+    ]
+}
+
 pub fn build_ssm_session_command(instance_id: &str, region: &str) -> String {
-    format!("aws ssm start-session --target {instance_id} --region {region}")
+    format!(
+        "aws {}",
+        build_ssm_session_args(instance_id, region).join(" ")
+    )
 }
 
 pub fn build_ssm_port_forward_command(
@@ -244,7 +202,8 @@ pub fn build_ssm_port_forward_command(
     remote_port: u16,
 ) -> String {
     format!(
-        "aws ssm start-session --target {instance_id} --region {region} --document-name AWS-StartPortForwardingSession --parameters localPortNumber={local_port},portNumber={remote_port}"
+        "aws {}",
+        build_ssm_port_forward_args(instance_id, region, local_port, remote_port).join(" ")
     )
 }
 
@@ -283,10 +242,6 @@ pub fn build_launch_plan(
         TerminalKind::Cmd => {
             args.push("/k".to_string());
             args.push(session_command.to_string());
-        }
-        TerminalKind::GitBash | TerminalKind::Msys2 => {
-            args.push("-lc".to_string());
-            args.push(format!("{}; exec bash", session_command));
         }
         TerminalKind::Wsl => {
             args.push("--".to_string());
@@ -495,7 +450,7 @@ mod tests {
     #[test]
     fn pick_default_terminal_prefers_saved_terminal_id() {
         let mut config = AppConfig::default();
-        config.default_terminal = Some("msys2-bash".to_string());
+        config.default_terminal = Some("cmd".to_string());
         let terminals = vec![
             TerminalOption {
                 id: "pwsh".to_string(),
@@ -504,14 +459,14 @@ mod tests {
                 program: "pwsh".to_string(),
             },
             TerminalOption {
-                id: "msys2-bash".to_string(),
-                display_name: "MSYS2 Bash".to_string(),
-                kind: TerminalKind::GitBash,
-                program: "C:\\msys64\\usr\\bin\\bash.exe".to_string(),
+                id: "cmd".to_string(),
+                display_name: "Command Prompt".to_string(),
+                kind: TerminalKind::Cmd,
+                program: "cmd.exe".to_string(),
             },
         ];
 
         let got = pick_default_terminal(&config, &terminals).expect("terminal selected");
-        assert_eq!(got.id, "msys2-bash");
+        assert_eq!(got.id, "cmd");
     }
 }

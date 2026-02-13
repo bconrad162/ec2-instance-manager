@@ -8,12 +8,6 @@ $workingDir = Split-Path -Parent $exePath
 $appDataDir = Join-Path $sharePath "appdata"
 $configDir = Join-Path $appDataDir "ec2-manager"
 $configPath = Join-Path $configDir "config.ini"
-$msys2Candidates = @(
-  "C:\msys64\usr\bin\bash.exe"
-  "C:\msys64\usr\bin\bash.exe"
-  "C:\tools\msys64\usr\bin\bash.exe"
-) | Select-Object -Unique
-$msys2Bash = $msys2Candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
 
 for ($i = 0; $i -lt 120; $i++) {
   if (Test-Path $sharePath) { break }
@@ -29,19 +23,12 @@ if (-not (Test-Path $exePath)) {
   exit 1
 }
 
-if (-not $msys2Bash) {
-  Set-Content -Path $resultFile -Value "FAIL:msys2-not-found" -Encoding Ascii -Force
-  exit 1
-}
-
 Remove-Item -Path $markerFile -ErrorAction SilentlyContinue
 Remove-Item -Path $resultFile -ErrorAction SilentlyContinue
 
-$msys2Root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $msys2Bash))
 New-Item -ItemType Directory -Path $configDir -Force | Out-Null
-Set-Content -Path $configPath -Value "default_mode=sim`ndefault_terminal=msys2-bash`n" -Encoding Ascii -Force
+Set-Content -Path $configPath -Value "default_mode=sim`ndefault_terminal=powershell`n" -Encoding Ascii -Force
 $env:APPDATA = $appDataDir
-$env:MSYS2_ROOT = $msys2Root
 
 $env:EC2_MANAGER_GUI_SMOKE_MARKER = $markerFile
 $env:EC2_MANAGER_GUI_SMOKE_EXPECTED_TEXT = "[SIM MODE] session open for"
@@ -53,7 +40,7 @@ $deadline = (Get-Date).AddSeconds(240)
 
 while ((Get-Date) -lt $deadline) {
   if (Test-Path $markerFile) {
-    Set-Content -Path $resultFile -Value "PASS`nterminal=msys2-bash`nmsys2_bash=$msys2Bash" -Encoding Ascii -Force
+    Set-Content -Path $resultFile -Value "PASS`nterminal=powershell" -Encoding Ascii -Force
     if (-not $proc.HasExited) {
       Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
     }
