@@ -1363,11 +1363,48 @@ mod gui {
 
         fn forward_terminal_key_input(&mut self, ctx: &egui::Context, tab_id: u64) {
             let events = ctx.input(|i| i.raw.events.clone());
+            let current_modifiers = ctx.input(|i| i.modifiers);
             let has_text = events.iter().any(|e| matches!(e, egui::Event::Text(_)));
+            let has_key_backspace = events.iter().any(|e| {
+                matches!(
+                    e,
+                    egui::Event::Key {
+                        key: egui::Key::Backspace,
+                        pressed: true,
+                        ..
+                    }
+                )
+            });
+            let mut sent_etx = false;
             for event in events {
+                // egui emits Event::Copy for Ctrl+C regardless of shift.
+                // We intercept it here so we can check modifiers: plain
+                // Ctrl+C → send ETX (0x03), Ctrl+Shift+C → let egui copy.
+                if matches!(event, egui::Event::Copy) {
+                    if !current_modifiers.shift && !sent_etx {
+                        self.log_trace(format!(
+                            "terminal input event tab={tab_id} kind=Copy→ETX"
+                        ));
+                        self.send_raw_bytes_to_connection_tab(tab_id, &[0x03]);
+                        sent_etx = true;
+                    }
+                    continue;
+                }
+                // Let egui handle Cut natively (clipboard cut).
+                if matches!(event, egui::Event::Cut) {
+                    continue;
+                }
                 if let Some(payload) =
-                    terminal_event_payload_for_terminal(&event, has_text)
+                    terminal_event_payload_for_terminal(&event, has_text, has_key_backspace)
                 {
+                    // Dedup: if we already sent ETX via the Copy path above,
+                    // skip a second ETX from the Key::C arm.
+                    if payload == [0x03] && sent_etx {
+                        continue;
+                    }
+                    if payload == [0x03] {
+                        sent_etx = true;
+                    }
                     self.log_trace(format!(
                         "terminal input event tab={tab_id} kind={}",
                         terminal_event_kind(&event)
@@ -1775,11 +1812,17 @@ mod gui {
                                                 )
                                             };
                                         terminal_job.wrap.max_width = size.x.max(1.0);
-                                        ui.add_sized(
+                                        ui.allocate_ui_with_layout(
                                             size,
-                                            egui::Label::new(terminal_job)
-                                                .sense(egui::Sense::click()),
+                                            egui::Layout::left_to_right(egui::Align::Min),
+                                            |ui| {
+                                                ui.add(
+                                                    egui::Label::new(terminal_job)
+                                                        .sense(egui::Sense::click()),
+                                                )
+                                            },
                                         )
+                                        .inner
                                     })
                                     .inner
                             },
@@ -2949,16 +2992,32 @@ mod gui {
     fn terminal_event_payload_for_terminal(
         event: &egui::Event,
         has_text: bool,
+        has_key_backspace: bool,
     ) -> Option<Vec<u8>> {
         match event {
             egui::Event::Text(text) => {
-                if text.chars().any(|c| c.is_control()) {
+                // BS (\x08) may arrive as a Text event on some platforms
+                // when egui does not emit Key::Backspace.  Forward it as
+                // the terminal backspace byte, but only when no explicit
+                // Key::Backspace event is present (to avoid double-send).
+                if text == "\x08" {
+                    if has_key_backspace {
+                        None
+                    } else {
+                        Some(vec![0x08])
+                    }
+                } else if text.chars().any(|c| c.is_control()) {
                     None
                 } else {
                     Some(text.as_bytes().to_vec())
                 }
             }
             egui::Event::Paste(text) => Some(text.as_bytes().to_vec()),
+            // Copy/Cut events carry no modifier info so we cannot
+            // distinguish Ctrl+C from Ctrl+Shift+C here.  These are
+            // handled in forward_terminal_key_input instead.
+            egui::Event::Copy => None,
+            egui::Event::Cut => None,
             egui::Event::Key {
                 key,
                 pressed: true,
@@ -2966,14 +3025,17 @@ mod gui {
                 ..
             } => match key {
                 egui::Key::Enter => Some(b"\r".to_vec()),
-                egui::Key::Backspace => Some(vec![0x7f]),
+                egui::Key::Backspace => Some(vec![0x08]),
                 egui::Key::Tab => Some(b"\t".to_vec()),
                 egui::Key::Escape => Some(vec![0x1b]),
                 egui::Key::ArrowUp => Some(b"\x1b[A".to_vec()),
                 egui::Key::ArrowDown => Some(b"\x1b[B".to_vec()),
                 egui::Key::ArrowRight => Some(b"\x1b[C".to_vec()),
                 egui::Key::ArrowLeft => Some(b"\x1b[D".to_vec()),
-                egui::Key::C if modifiers.ctrl => Some(vec![0x03]),
+                egui::Key::Home => Some(b"\x1b[H".to_vec()),
+                egui::Key::End => Some(b"\x1b[F".to_vec()),
+                egui::Key::Delete => Some(b"\x1b[3~".to_vec()),
+                egui::Key::C if modifiers.ctrl && !modifiers.shift => Some(vec![0x03]),
                 egui::Key::D if modifiers.ctrl => Some(vec![0x04]),
                 egui::Key::L if modifiers.ctrl => Some(vec![0x0c]),
                 egui::Key::U if modifiers.ctrl => Some(vec![0x15]),
@@ -2995,6 +3057,8 @@ mod gui {
         match event {
             egui::Event::Text(_) => "text".to_string(),
             egui::Event::Paste(_) => "paste".to_string(),
+            egui::Event::Copy => "copy".to_string(),
+            egui::Event::Cut => "cut".to_string(),
             egui::Event::Key { key, .. } => format!("key:{key:?}"),
             egui::Event::PointerButton { .. } => "pointer_button".to_string(),
             egui::Event::PointerMoved(_) => "pointer_moved".to_string(),
@@ -3699,7 +3763,7 @@ mod gui {
                 },
             };
             assert_eq!(
-                terminal_event_payload_for_terminal(&ctrl_c, false),
+                terminal_event_payload_for_terminal(&ctrl_c, false, false),
                 Some(vec![0x03])
             );
 
@@ -3711,7 +3775,7 @@ mod gui {
                 modifiers: egui::Modifiers::default(),
             };
             assert_eq!(
-                terminal_event_payload_for_terminal(&enter, false),
+                terminal_event_payload_for_terminal(&enter, false, false),
                 Some(b"\r".to_vec())
             );
 
@@ -3726,7 +3790,7 @@ mod gui {
                 },
             };
             assert_eq!(
-                terminal_event_payload_for_terminal(&ctrl_w, false),
+                terminal_event_payload_for_terminal(&ctrl_w, false, false),
                 Some(vec![0x17])
             );
 
@@ -3741,14 +3805,66 @@ mod gui {
                 },
             };
             assert_eq!(
-                terminal_event_payload_for_terminal(&ctrl_u, false),
+                terminal_event_payload_for_terminal(&ctrl_u, false, false),
                 Some(vec![0x15])
             );
 
             let paste = egui::Event::Paste("echo hi".to_string());
             assert_eq!(
-                terminal_event_payload_for_terminal(&paste, false),
+                terminal_event_payload_for_terminal(&paste, false, false),
                 Some("echo hi".as_bytes().to_vec())
+            );
+        }
+
+        #[test]
+        fn terminal_event_payload_copy_returns_none() {
+            // Copy events are handled in forward_terminal_key_input, not here
+            assert_eq!(
+                terminal_event_payload_for_terminal(&egui::Event::Copy, false, false),
+                None
+            );
+        }
+
+        #[test]
+        fn terminal_event_payload_cut_returns_none() {
+            // Cut events are handled natively by egui
+            assert_eq!(
+                terminal_event_payload_for_terminal(&egui::Event::Cut, false, false),
+                None
+            );
+        }
+
+        #[test]
+        fn terminal_event_payload_ctrl_shift_c_returns_none() {
+            let ctrl_shift_c = egui::Event::Key {
+                key: egui::Key::C,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    ctrl: true,
+                    shift: true,
+                    ..Default::default()
+                },
+            };
+            assert_eq!(
+                terminal_event_payload_for_terminal(&ctrl_shift_c, false, false),
+                None
+            );
+        }
+
+        #[test]
+        fn terminal_event_payload_backspace_sends_bs() {
+            let bs = egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            };
+            assert_eq!(
+                terminal_event_payload_for_terminal(&bs, false, false),
+                Some(vec![0x08])
             );
         }
 
@@ -3762,11 +3878,11 @@ mod gui {
                 modifiers: egui::Modifiers::default(),
             };
             assert_eq!(
-                terminal_event_payload_for_terminal(&key_a, false),
+                terminal_event_payload_for_terminal(&key_a, false, false),
                 Some(vec![b'a'])
             );
             assert_eq!(
-                terminal_event_payload_for_terminal(&key_a, true),
+                terminal_event_payload_for_terminal(&key_a, true, false),
                 None
             );
 
@@ -3781,20 +3897,43 @@ mod gui {
                 },
             };
             assert_eq!(
-                terminal_event_payload_for_terminal(&key_a_shift, false),
+                terminal_event_payload_for_terminal(&key_a_shift, false, false),
                 Some(vec![b'A'])
             );
             assert_eq!(
-                terminal_event_payload_for_terminal(&key_a_shift, true),
+                terminal_event_payload_for_terminal(&key_a_shift, true, false),
                 None
             );
         }
 
         #[test]
-        fn terminal_event_payload_ignores_control_text() {
-            let ctrl_text = egui::Event::Text("\u{8}".to_string());
+        fn terminal_event_payload_text_bs_without_key_backspace() {
+            // When no Key::Backspace event is present, Text("\x08")
+            // should be forwarded as BS (0x08).
+            let text_bs = egui::Event::Text("\u{8}".to_string());
             assert_eq!(
-                terminal_event_payload_for_terminal(&ctrl_text, false),
+                terminal_event_payload_for_terminal(&text_bs, false, false),
+                Some(vec![0x08])
+            );
+        }
+
+        #[test]
+        fn terminal_event_payload_text_bs_skipped_when_key_backspace_present() {
+            // When Key::Backspace IS present, Text("\x08") should be
+            // suppressed to avoid double-sending.
+            let text_bs = egui::Event::Text("\u{8}".to_string());
+            assert_eq!(
+                terminal_event_payload_for_terminal(&text_bs, false, true),
+                None
+            );
+        }
+
+        #[test]
+        fn terminal_event_payload_ignores_other_control_text() {
+            // Control chars other than BS should still be filtered.
+            let ctrl_text = egui::Event::Text("\u{1}".to_string());
+            assert_eq!(
+                terminal_event_payload_for_terminal(&ctrl_text, false, false),
                 None
             );
         }
