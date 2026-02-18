@@ -5,9 +5,12 @@ edition = "2021"
 
 [features]
 default = []
-gui = ["dep:eframe", "dep:portable-pty", "dep:vt100"]
+gui = ["dep:eframe", "dep:portable-pty", "dep:vt100", "dep:arboard", "dep:rfd", "dep:base64"]
 
 [dependencies]
 eframe = { version = "0.33.3", optional = true }
 portable-pty = { version = "0.9", optional = true }
 vt100 = { version = "0.16.2", optional = true }
+arboard = { version = "3", optional = true }
+rfd = { version = "0.15", optional = true }
+base64 = { version = "0.22", optional = true }

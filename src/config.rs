@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub recents: Vec<RecentConnection>,
     pub saved_filters: BTreeMap<String, Vec<SavedFilter>>,
     pub port_forward_presets: Vec<PortForwardPreset>,
+    pub theme: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -46,6 +47,7 @@ impl Default for AppConfig {
                     remote_port: 5432,
                 },
             ],
+            theme: None,
         }
     }
 }
@@ -315,6 +317,13 @@ impl AppConfig {
                         cfg.upsert_port_forward_preset(preset);
                     }
                 }
+                "theme" => {
+                    cfg.theme = if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    };
+                }
                 _ => {}
             }
         }
@@ -338,6 +347,10 @@ impl AppConfig {
             format!("role_keys={}", self.tag_mapping.role_keys.join(",")),
             format!("team_keys={}", self.tag_mapping.team_keys.join(",")),
         ];
+
+        if let Some(theme) = &self.theme {
+            lines.push(format!("theme={theme}"));
+        }
 
         for (account, region) in &self.account_regions {
             lines.push(format!("account_region.{account}={region}"));

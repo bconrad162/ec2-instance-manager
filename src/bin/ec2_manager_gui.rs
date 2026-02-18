@@ -49,7 +49,6 @@ mod gui {
     const GUI_MIN_HEIGHT: f32 = 760.0;
     const PROFILE_POLL_INTERVAL: Duration = Duration::from_secs(1);
     const PROFILE_CHANGE_DEBOUNCE: Duration = Duration::from_secs(2);
-    const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(450);
     const GUI_SMOKE_MARKER_ENV: &str = "EC2_MANAGER_GUI_SMOKE_MARKER";
     const GUI_SMOKE_EXPECTED_TEXT_ENV: &str = "EC2_MANAGER_GUI_SMOKE_EXPECTED_TEXT";
     const GUI_SMOKE_EXIT_ON_MARKER_ENV: &str = "EC2_MANAGER_GUI_SMOKE_EXIT_ON_MARKER";
@@ -250,6 +249,79 @@ mod gui {
         args: Vec<String>,
     }
 
+    #[derive(Clone, Debug)]
+    #[allow(dead_code)]
+    struct FileEntry {
+        name: String,
+        is_dir: bool,
+        size: u64,
+        permissions: String,
+        modified: String,
+    }
+
+    #[derive(Clone, Debug)]
+    enum FileOpStatus {
+        Idle,
+        Listing,
+        Downloading,
+        Uploading,
+        Error(String),
+    }
+
+    struct FileBrowserState {
+        current_path: String,
+        entries: Vec<FileEntry>,
+        status: FileOpStatus,
+        selected_entry: Option<usize>,
+        path_input: String,
+        initialized: bool,
+    }
+
+    impl Default for FileBrowserState {
+        fn default() -> Self {
+            Self {
+                current_path: String::new(),
+                entries: Vec::new(),
+                status: FileOpStatus::Idle,
+                selected_entry: None,
+                path_input: String::new(),
+                initialized: false,
+            }
+        }
+    }
+
+    enum FileOpEvent {
+        ListingCompleted {
+            tab_id: u64,
+            path: String,
+            entries: Vec<FileEntry>,
+        },
+        ListingFailed {
+            tab_id: u64,
+            error: String,
+        },
+        DownloadCompleted {
+            tab_id: u64,
+            remote_path: String,
+            local_path: String,
+            bytes: u64,
+        },
+        DownloadFailed {
+            tab_id: u64,
+            error: String,
+        },
+        UploadCompleted {
+            tab_id: u64,
+            local_path: String,
+            remote_path: String,
+            bytes: u64,
+        },
+        UploadFailed {
+            tab_id: u64,
+            error: String,
+        },
+    }
+
     /// Git-bash-style PS1 prompt sent to the remote shell when the user
     /// clicks "Update PS1".  Produces:
     ///   (blank line)
@@ -426,7 +498,15 @@ mod gui {
             eframe::run_native(
                 title,
                 native_options,
-                Box::new(move |_cc| Ok(Box::new(Ec2GuiApp::new(app_options.clone())))),
+                Box::new(move |cc| {
+                    let app = Ec2GuiApp::new(app_options.clone());
+                    if app.dark_mode {
+                        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+                    } else {
+                        cc.egui_ctx.set_visuals(egui::Visuals::light());
+                    }
+                    Ok(Box::new(app))
+                }),
             )
         }));
 
@@ -501,6 +581,10 @@ mod gui {
         refresh_tx: Sender<RefreshEvent>,
         refresh_rx: Receiver<RefreshEvent>,
         refreshing: bool,
+        dark_mode: bool,
+        file_browsers: HashMap<u64, FileBrowserState>,
+        file_op_tx: Sender<FileOpEvent>,
+        file_op_rx: Receiver<FileOpEvent>,
         #[cfg(target_os = "windows")]
         ui_tx: Sender<UiEvent>,
         #[cfg(target_os = "windows")]
@@ -515,6 +599,7 @@ mod gui {
             let dependencies = dependency_status();
             let (proc_tx, proc_rx) = mpsc::channel();
             let (refresh_tx, refresh_rx) = mpsc::channel();
+            let (file_op_tx, file_op_rx) = mpsc::channel();
             #[cfg(target_os = "windows")]
             let (ui_tx, ui_rx) = mpsc::channel();
             let profile_choice_path = profile_choice_path();
@@ -522,6 +607,7 @@ mod gui {
             let terminals = filter_embedded_terminals(discover_terminals());
             let selected_terminal_id = initial_terminal_id(&config, &terminals);
             let gui_smoke = gui_smoke_config_from_env();
+            let dark_mode = config.theme.as_deref() != Some("light");
 
             let mut app = Self {
                 options,
@@ -565,6 +651,10 @@ mod gui {
                 refresh_tx,
                 refresh_rx,
                 refreshing: false,
+                dark_mode,
+                file_browsers: HashMap::new(),
+                file_op_tx,
+                file_op_rx,
                 #[cfg(target_os = "windows")]
                 ui_tx,
                 #[cfg(target_os = "windows")]
@@ -989,6 +1079,20 @@ mod gui {
                 terminal_debug_label(selected_terminal.as_ref())
             ));
             let tab_id = self.connections.open(title.clone(), instance_id.clone());
+            let default_path = if context.mode == Mode::Sim {
+                std::env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| "/".to_string())
+            } else {
+                "/home/ssm-user".to_string()
+            };
+            let mut fb_state = FileBrowserState {
+                current_path: default_path.clone(),
+                path_input: default_path.clone(),
+                ..Default::default()
+            };
+            fb_state.initialized = false;
+            self.file_browsers.insert(tab_id, fb_state);
             self.log_info(format!(
                 "opened connection tab id={tab_id} instance={instance_id}"
             ));
@@ -1348,8 +1452,279 @@ mod gui {
                     }
                 });
             }
+            self.file_browsers.remove(&tab_id);
             self.connections.close(tab_id);
             self.log_info(format!("closed connection tab id={tab_id}"));
+        }
+
+        fn request_file_listing(&mut self, tab_id: u64, path: String) {
+            let Some(fb) = self.file_browsers.get_mut(&tab_id) else {
+                return;
+            };
+            fb.status = FileOpStatus::Listing;
+            fb.current_path = path.clone();
+            fb.path_input = path.clone();
+            fb.selected_entry = None;
+
+            let tab = self.connections.selected_ref().cloned();
+            let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
+            let mode = self.options.mode.clone();
+            let context = self.context.clone();
+            let tx = self.file_op_tx.clone();
+
+            std::thread::spawn(move || {
+                let result = if mode == Mode::Sim {
+                    list_files_local(&path)
+                } else if let Some(ctx) = &context {
+                    let cmd = format!("ls -la {path}");
+                    match ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd) {
+                        Ok(command_id) => {
+                            match ssm_wait_for_command(
+                                &ctx.profile,
+                                &ctx.region,
+                                &instance_id,
+                                &command_id,
+                            ) {
+                                Ok(output) => Ok(parse_ls_output(&output)),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Err("no AWS context available".to_string())
+                };
+
+                match result {
+                    Ok(entries) => {
+                        let _ = tx.send(FileOpEvent::ListingCompleted {
+                            tab_id,
+                            path,
+                            entries,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(FileOpEvent::ListingFailed { tab_id, error });
+                    }
+                }
+            });
+        }
+
+        fn request_file_download(
+            &mut self,
+            tab_id: u64,
+            remote_path: String,
+            local_path: String,
+        ) {
+            let Some(fb) = self.file_browsers.get_mut(&tab_id) else {
+                return;
+            };
+            fb.status = FileOpStatus::Downloading;
+
+            let tab = self.connections.selected_ref().cloned();
+            let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
+            let mode = self.options.mode.clone();
+            let context = self.context.clone();
+            let tx = self.file_op_tx.clone();
+
+            std::thread::spawn(move || {
+                let result = if mode == Mode::Sim {
+                    std::fs::read(&remote_path)
+                        .and_then(|data| {
+                            let bytes = data.len() as u64;
+                            std::fs::write(&local_path, &data)?;
+                            Ok(bytes)
+                        })
+                        .map_err(|e| e.to_string())
+                } else if let Some(ctx) = &context {
+                    let cmd = format!("base64 {remote_path}");
+                    ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd)
+                        .and_then(|command_id| {
+                            ssm_wait_for_command(
+                                &ctx.profile,
+                                &ctx.region,
+                                &instance_id,
+                                &command_id,
+                            )
+                        })
+                        .and_then(|b64_output| {
+                            use base64::Engine;
+                            let cleaned: String =
+                                b64_output.chars().filter(|c| !c.is_whitespace()).collect();
+                            let data = base64::engine::general_purpose::STANDARD
+                                .decode(&cleaned)
+                                .map_err(|e| format!("base64 decode failed: {e}"))?;
+                            let bytes = data.len() as u64;
+                            std::fs::write(&local_path, &data)
+                                .map_err(|e| format!("write local file failed: {e}"))?;
+                            Ok(bytes)
+                        })
+                } else {
+                    Err("no AWS context available".to_string())
+                };
+
+                match result {
+                    Ok(bytes) => {
+                        let _ = tx.send(FileOpEvent::DownloadCompleted {
+                            tab_id,
+                            remote_path,
+                            local_path,
+                            bytes,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(FileOpEvent::DownloadFailed { tab_id, error });
+                    }
+                }
+            });
+        }
+
+        fn request_file_upload(
+            &mut self,
+            tab_id: u64,
+            local_path: String,
+            remote_dir: String,
+        ) {
+            let Some(fb) = self.file_browsers.get_mut(&tab_id) else {
+                return;
+            };
+            fb.status = FileOpStatus::Uploading;
+
+            let tab = self.connections.selected_ref().cloned();
+            let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
+            let mode = self.options.mode.clone();
+            let context = self.context.clone();
+            let tx = self.file_op_tx.clone();
+            let file_name = std::path::Path::new(&local_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "uploaded_file".to_string());
+            let remote_path = join_path(&remote_dir, &file_name);
+
+            std::thread::spawn(move || {
+                let result = if mode == Mode::Sim {
+                    std::fs::read(&local_path)
+                        .and_then(|data| {
+                            let bytes = data.len() as u64;
+                            std::fs::write(&remote_path, &data)?;
+                            Ok(bytes)
+                        })
+                        .map_err(|e| e.to_string())
+                } else if let Some(ctx) = &context {
+                    std::fs::read(&local_path)
+                        .map_err(|e| format!("read local file failed: {e}"))
+                        .and_then(|data| {
+                            use base64::Engine;
+                            let bytes = data.len() as u64;
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                            let cmd =
+                                format!("echo '{}' | base64 -d > {}", b64, remote_path);
+                            ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd)
+                                .and_then(|command_id| {
+                                    ssm_wait_for_command(
+                                        &ctx.profile,
+                                        &ctx.region,
+                                        &instance_id,
+                                        &command_id,
+                                    )
+                                })?;
+                            Ok(bytes)
+                        })
+                } else {
+                    Err("no AWS context available".to_string())
+                };
+
+                match result {
+                    Ok(bytes) => {
+                        let _ = tx.send(FileOpEvent::UploadCompleted {
+                            tab_id,
+                            local_path,
+                            remote_path,
+                            bytes,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(FileOpEvent::UploadFailed { tab_id, error });
+                    }
+                }
+            });
+        }
+
+        fn poll_file_op_events(&mut self) {
+            while let Ok(event) = self.file_op_rx.try_recv() {
+                match event {
+                    FileOpEvent::ListingCompleted {
+                        tab_id,
+                        path,
+                        entries,
+                    } => {
+                        self.log_info(format!(
+                            "file listing completed tab={tab_id} path={path} entries={}",
+                            entries.len()
+                        ));
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            fb.entries = entries;
+                            fb.status = FileOpStatus::Idle;
+                            fb.initialized = true;
+                        }
+                    }
+                    FileOpEvent::ListingFailed { tab_id, error } => {
+                        self.log_error(format!(
+                            "file listing failed tab={tab_id}: {error}"
+                        ));
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            fb.status = FileOpStatus::Error(error);
+                        }
+                    }
+                    FileOpEvent::DownloadCompleted {
+                        tab_id,
+                        remote_path,
+                        local_path,
+                        bytes,
+                    } => {
+                        self.log_info(format!(
+                            "download completed tab={tab_id} {remote_path} -> {local_path} ({bytes} bytes)"
+                        ));
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            fb.status = FileOpStatus::Idle;
+                        }
+                    }
+                    FileOpEvent::DownloadFailed { tab_id, error } => {
+                        self.log_error(format!(
+                            "download failed tab={tab_id}: {error}"
+                        ));
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            fb.status = FileOpStatus::Error(error);
+                        }
+                    }
+                    FileOpEvent::UploadCompleted {
+                        tab_id,
+                        local_path,
+                        remote_path,
+                        bytes,
+                    } => {
+                        self.log_info(format!(
+                            "upload completed tab={tab_id} {local_path} -> {remote_path} ({bytes} bytes)"
+                        ));
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            fb.status = FileOpStatus::Idle;
+                            let path = fb.current_path.clone();
+                            let tab_id_copy = tab_id;
+                            // queue re-listing after upload
+                            self.request_file_listing(tab_id_copy, path);
+                            return;
+                        }
+                    }
+                    FileOpEvent::UploadFailed { tab_id, error } => {
+                        self.log_error(format!(
+                            "upload failed tab={tab_id}: {error}"
+                        ));
+                        if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                            fb.status = FileOpStatus::Error(error);
+                        }
+                    }
+                }
+            }
         }
 
         fn send_raw_bytes_to_connection_tab(&mut self, tab_id: u64, payload: &[u8]) {
@@ -1363,7 +1738,7 @@ mod gui {
             let Ok(mut stdin) = session.writer.lock() else {
                 return;
             };
-            let write_result = stdin.write_all(payload);
+            let write_result = stdin.write_all(payload).and_then(|()| stdin.flush());
             drop(stdin);
             if let Err(err) = write_result {
                 self.log_error(format!("tab={tab_id} write error: {err}"));
@@ -1787,75 +2162,319 @@ mod gui {
                 });
                 ui.separator();
 
+                // Trigger initial file listing if not yet initialized
+                if let Some(fb) = self.file_browsers.get(&tab.id) {
+                    if !fb.initialized && matches!(fb.status, FileOpStatus::Idle) {
+                        let path = fb.current_path.clone();
+                        self.request_file_listing(tab.id, path);
+                    }
+                }
+
                 let show_cursor = ui.input(|i| ((i.time * 2.0) as i64) % 2 == 0);
                 let font_id = egui::TextStyle::Monospace.resolve(ui.style());
                 let tab_id = tab.id;
                 let tab_lines = tab.lines.clone();
+                let available = ui.available_size();
+                let file_browser_width = 220.0_f32;
 
-                let terminal_response = egui::Frame::NONE
-                    .fill(terminal_panel_fill())
-                    .inner_margin(egui::Margin::same(0))
-                    .show(ui, |ui| {
-                        let available = ui.available_size();
-                        ui.allocate_ui_with_layout(
-                            available,
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                ui.set_min_width(available.x);
-                                egui::ScrollArea::vertical()
-                                    .auto_shrink([false, false])
-                                    .stick_to_bottom(true)
-                                    .show(ui, |ui| {
-                                        let size = ui.available_size();
-                                        let (rows, cols) =
-                                            terminal_grid_from_pixels(ui, &font_id, size);
-                                        let mut terminal_job =
-                                            if let Some(session) =
-                                                self.pty_sessions.get_mut(&tab_id)
-                                            {
-                                                resize_pty_session(session, rows, cols);
-                                                terminal_layout_job(
-                                                    session.parser.screen(),
-                                                    show_cursor,
-                                                    font_id.clone(),
-                                                )
-                                            } else {
-                                                terminal_plain_layout_job(
-                                                    &tab_lines.join("\n"),
-                                                    font_id.clone(),
-                                                )
-                                            };
-                                        terminal_job.wrap.max_width = size.x.max(1.0);
-                                        ui.allocate_ui_with_layout(
-                                            size,
-                                            egui::Layout::left_to_right(egui::Align::Min),
-                                            |ui| {
-                                                ui.add(
-                                                    egui::Label::new(terminal_job)
-                                                        .sense(egui::Sense::click()),
-                                                )
-                                            },
-                                        )
+                ui.horizontal(|ui| {
+                    // Left: File browser panel
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(file_browser_width, available.y),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            self.render_file_browser(ui, tab_id);
+                        },
+                    );
+
+                    ui.separator();
+
+                    // Right: Terminal with outer banner
+                    let banner_fill = if self.dark_mode {
+                        egui::Color32::from_rgb(44, 44, 44)
+                    } else {
+                        ui.visuals().panel_fill
+                    };
+
+                    let remaining_width = (available.x - file_browser_width - 12.0).max(100.0);
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(remaining_width, available.y),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            let terminal_response = egui::Frame::NONE
+                                .fill(banner_fill)
+                                .inner_margin(egui::Margin::same(4))
+                                .corner_radius(egui::CornerRadius::same(2))
+                                .show(ui, |ui| {
+                                    egui::Frame::NONE
+                                        .fill(terminal_panel_fill())
+                                        .inner_margin(egui::Margin::same(0))
+                                        .show(ui, |ui| {
+                                            let available = ui.available_size();
+                                            ui.allocate_ui_with_layout(
+                                                available,
+                                                egui::Layout::top_down(egui::Align::Min),
+                                                |ui| {
+                                                    ui.set_min_width(available.x);
+                                                    egui::ScrollArea::vertical()
+                                                        .auto_shrink([false, false])
+                                                        .stick_to_bottom(true)
+                                                        .show(ui, |ui| {
+                                                            let size = ui.available_size();
+                                                            let (rows, cols) =
+                                                                terminal_grid_from_pixels(
+                                                                    ui, &font_id, size,
+                                                                );
+                                                            let mut terminal_job =
+                                                                if let Some(session) =
+                                                                    self.pty_sessions
+                                                                        .get_mut(&tab_id)
+                                                                {
+                                                                    resize_pty_session(
+                                                                        session, rows, cols,
+                                                                    );
+                                                                    terminal_layout_job(
+                                                                        session.parser.screen(),
+                                                                        show_cursor,
+                                                                        font_id.clone(),
+                                                                    )
+                                                                } else {
+                                                                    terminal_plain_layout_job(
+                                                                        &tab_lines.join("\n"),
+                                                                        font_id.clone(),
+                                                                    )
+                                                                };
+                                                            terminal_job.wrap.max_width =
+                                                                size.x.max(1.0);
+                                                            ui.allocate_ui_with_layout(
+                                                                size,
+                                                                egui::Layout::left_to_right(
+                                                                    egui::Align::Min,
+                                                                ),
+                                                                |ui| {
+                                                                    ui.add(
+                                                                        egui::Label::new(
+                                                                            terminal_job,
+                                                                        )
+                                                                        .sense(
+                                                                            egui::Sense::click(),
+                                                                        ),
+                                                                    )
+                                                                },
+                                                            )
+                                                            .inner
+                                                        })
+                                                        .inner
+                                                },
+                                            )
+                                            .inner
+                                        })
                                         .inner
-                                    })
-                                    .inner
-                            },
-                        )
-                        .inner
-                    });
-                let terminal_focus_id = ui.make_persistent_id(("terminal_focus", tab.id));
-                let terminal_focus_response = ui.interact(
-                    terminal_response.inner.rect,
-                    terminal_focus_id,
-                    egui::Sense::click(),
+                                });
+                            let terminal_focus_id =
+                                ui.make_persistent_id(("terminal_focus", tab_id));
+                            let terminal_focus_response = ui.interact(
+                                terminal_response.response.rect,
+                                terminal_focus_id,
+                                egui::Sense::click(),
+                            );
+                            if terminal_focus_response.clicked() {
+                                terminal_focus_response.request_focus();
+                                self.log_debug(format!(
+                                    "terminal focus requested tab={tab_id}"
+                                ));
+                            }
+                            if terminal_focus_response.secondary_clicked() {
+                                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                    if let Ok(text) = clipboard.get_text() {
+                                        if !text.is_empty() {
+                                            self.send_raw_bytes_to_connection_tab(
+                                                tab_id,
+                                                text.as_bytes(),
+                                            );
+                                            self.log_debug(format!(
+                                                "right-click paste tab={tab_id} bytes={}",
+                                                text.len()
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            if terminal_focus_response.has_focus() {
+                                self.forward_terminal_key_input(ui.ctx(), tab_id);
+                            }
+                        },
+                    );
+                });
+            }
+        }
+
+        fn render_file_browser(&mut self, ui: &mut egui::Ui, tab_id: u64) {
+            ui.label("File Browser");
+            ui.separator();
+
+            // Collect state to avoid borrow conflicts
+            let fb_snapshot = self.file_browsers.get(&tab_id).map(|fb| {
+                (
+                    fb.path_input.clone(),
+                    fb.current_path.clone(),
+                    fb.entries.clone(),
+                    fb.selected_entry,
+                    fb.status.clone(),
+                )
+            });
+
+            let Some((mut path_input, current_path, entries, selected_entry, status)) =
+                fb_snapshot
+            else {
+                ui.label("No file browser for this tab");
+                return;
+            };
+
+            // Path bar
+            let mut navigate_to: Option<String> = None;
+            let busy = matches!(
+                status,
+                FileOpStatus::Listing | FileOpStatus::Downloading | FileOpStatus::Uploading
+            );
+            ui.horizontal(|ui| {
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut path_input)
+                        .desired_width(150.0)
+                        .font(egui::TextStyle::Small),
                 );
-                if terminal_focus_response.clicked() {
-                    terminal_focus_response.request_focus();
-                    self.log_debug(format!("terminal focus requested tab={}", tab.id));
+                if response.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                {
+                    navigate_to = Some(path_input.clone());
                 }
-                if terminal_focus_response.has_focus() {
-                    self.forward_terminal_key_input(ui.ctx(), tab.id);
+                if ui.small_button("Go").clicked() {
+                    navigate_to = Some(path_input.clone());
                 }
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Refresh").small())
+                    .clicked()
+                {
+                    navigate_to = Some(current_path.clone());
+                }
+            });
+            // Write back path_input
+            if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                fb.path_input = path_input;
+            }
+
+            // Up button
+            if ui.button(".. (Up)").clicked() {
+                navigate_to = Some(parent_path(&current_path));
+            }
+
+            // Status indicator
+            match &status {
+                FileOpStatus::Listing => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading...");
+                    });
+                }
+                FileOpStatus::Downloading => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Downloading...");
+                    });
+                }
+                FileOpStatus::Uploading => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Uploading...");
+                    });
+                }
+                FileOpStatus::Error(err) => {
+                    ui.colored_label(egui::Color32::RED, truncate(err, 40));
+                }
+                FileOpStatus::Idle => {}
+            }
+
+            ui.separator();
+
+            // File list
+            let mut new_selected = selected_entry;
+            let mut double_clicked_dir: Option<String> = None;
+            egui::ScrollArea::vertical()
+                .max_height(ui.available_height() - 40.0)
+                .show(ui, |ui| {
+                    for (idx, entry) in entries.iter().enumerate() {
+                        let prefix = if entry.is_dir { ">" } else { " " };
+                        let label = format!("{prefix} {}", entry.name);
+                        let is_selected = selected_entry == Some(idx);
+                        let response =
+                            ui.selectable_label(is_selected, truncate(&label, 30));
+                        if response.clicked() {
+                            new_selected = Some(idx);
+                        }
+                        if response.double_clicked() && entry.is_dir {
+                            double_clicked_dir =
+                                Some(join_path(&current_path, &entry.name));
+                        }
+                    }
+                    if entries.is_empty()
+                        && matches!(status, FileOpStatus::Idle)
+                    {
+                        ui.label("(empty)");
+                    }
+                });
+
+            // Update selection
+            if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                fb.selected_entry = new_selected;
+            }
+
+            // Navigate on double-click dir
+            if let Some(dir_path) = double_clicked_dir {
+                navigate_to = Some(dir_path);
+            }
+
+            ui.separator();
+
+            // Upload / Download buttons
+            ui.horizontal(|ui| {
+                let can_download = selected_entry
+                    .and_then(|idx| entries.get(idx))
+                    .map(|e| !e.is_dir)
+                    .unwrap_or(false);
+                if ui
+                    .add_enabled(can_download, egui::Button::new("Download"))
+                    .clicked()
+                {
+                    if let Some(idx) = selected_entry {
+                        if let Some(entry) = entries.get(idx) {
+                            let remote = join_path(&current_path, &entry.name);
+                            let dialog = rfd::FileDialog::new()
+                                .set_file_name(&entry.name);
+                            if let Some(local) = dialog.save_file() {
+                                self.request_file_download(
+                                    tab_id,
+                                    remote,
+                                    local.to_string_lossy().to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
+                if ui.button("Upload").clicked() {
+                    let dialog = rfd::FileDialog::new();
+                    if let Some(local) = dialog.pick_file() {
+                        self.request_file_upload(
+                            tab_id,
+                            local.to_string_lossy().to_string(),
+                            current_path.clone(),
+                        );
+                    }
+                }
+            });
+
+            // Handle navigation
+            if let Some(path) = navigate_to {
+                self.request_file_listing(tab_id, path);
             }
         }
 
@@ -1928,11 +2547,22 @@ mod gui {
                 self.poll_profile_choice_changes();
                 self.poll_connection_events();
                 self.poll_refresh_events();
+                self.poll_file_op_events();
                 if self.refreshing {
                     ctx.request_repaint_after(Duration::from_millis(100));
                 }
                 if self.main_tab == MainTab::Connections && !self.pty_sessions.is_empty() {
-                    ctx.request_repaint_after(CURSOR_BLINK_INTERVAL);
+                    ctx.request_repaint_after(Duration::from_millis(16));
+                }
+                if self.file_browsers.values().any(|b| {
+                    matches!(
+                        b.status,
+                        FileOpStatus::Listing
+                            | FileOpStatus::Downloading
+                            | FileOpStatus::Uploading
+                    )
+                }) {
+                    ctx.request_repaint_after(Duration::from_millis(100));
                 }
                 if self.gui_smoke_should_close {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1991,6 +2621,33 @@ mod gui {
                 }
 
                 egui::TopBottomPanel::top("top").show(ctx, |ui| {
+                    egui::MenuBar::new().ui(ui, |ui| {
+                        ui.menu_button("Edit", |ui| {
+                            ui.menu_button("Theme", |ui| {
+                                if ui
+                                    .selectable_label(self.dark_mode, "Dark")
+                                    .clicked()
+                                {
+                                    self.dark_mode = true;
+                                    ctx.set_visuals(egui::Visuals::dark());
+                                    self.config.theme = Some("dark".to_string());
+                                    let _ = self.config.save();
+                                    ui.close();
+                                }
+                                if ui
+                                    .selectable_label(!self.dark_mode, "Light")
+                                    .clicked()
+                                {
+                                    self.dark_mode = false;
+                                    ctx.set_visuals(egui::Visuals::light());
+                                    self.config.theme = Some("light".to_string());
+                                    let _ = self.config.save();
+                                    ui.close();
+                                }
+                            });
+                        });
+                    });
+
                     ui.horizontal(|ui| {
                         ui.heading("EC2 + SSM Instance Explorer");
                         ui.separator();
@@ -3153,6 +3810,200 @@ mod gui {
             .unwrap_or_default()
     }
 
+    fn parent_path(path: &str) -> String {
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return "/".to_string();
+        }
+        match trimmed.rfind('/') {
+            Some(0) | None => "/".to_string(),
+            Some(idx) => trimmed[..idx].to_string(),
+        }
+    }
+
+    fn join_path(base: &str, component: &str) -> String {
+        if base == "/" {
+            format!("/{component}")
+        } else {
+            format!("{base}/{component}")
+        }
+    }
+
+    fn parse_ls_output(output: &str) -> Vec<FileEntry> {
+        let mut entries = Vec::new();
+        for line in output.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("total") {
+                continue;
+            }
+            // Split on runs of whitespace, limit to 9 fields so the filename
+            // (which may contain spaces) stays intact in the last element.
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 9 {
+                continue;
+            }
+            // The name is everything from the 9th field onward (index 8..)
+            let name = parts[8..].join(" ");
+            if name == "." || name == ".." {
+                continue;
+            }
+            let permissions = parts[0].to_string();
+            let is_dir = permissions.starts_with('d');
+            let size = parts[4].parse::<u64>().unwrap_or(0);
+            let modified = format!("{} {} {}", parts[5], parts[6], parts[7]);
+            entries.push(FileEntry {
+                name,
+                is_dir,
+                size,
+                permissions,
+                modified,
+            });
+        }
+        sort_file_entries(&mut entries);
+        entries
+    }
+
+    fn sort_file_entries(entries: &mut [FileEntry]) {
+        entries.sort_by(|a, b| {
+            b.is_dir
+                .cmp(&a.is_dir)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
+    }
+
+    fn list_files_local(path: &str) -> std::result::Result<Vec<FileEntry>, String> {
+        let read_dir =
+            std::fs::read_dir(path).map_err(|e| format!("failed to read {path}: {e}"))?;
+        let mut entries = Vec::new();
+        for entry in read_dir {
+            let entry = entry.map_err(|e| format!("read_dir entry error: {e}"))?;
+            let metadata = entry.metadata().map_err(|e| format!("metadata error: {e}"))?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = metadata.is_dir();
+            let size = metadata.len();
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| {
+                    let secs = d.as_secs();
+                    format!("{secs}")
+                })
+                .unwrap_or_default();
+            let permissions = if is_dir {
+                "drwxr-xr-x".to_string()
+            } else {
+                "-rw-r--r--".to_string()
+            };
+            entries.push(FileEntry {
+                name,
+                is_dir,
+                size,
+                permissions,
+                modified,
+            });
+        }
+        sort_file_entries(&mut entries);
+        Ok(entries)
+    }
+
+    fn ssm_send_command(
+        profile: &str,
+        region: &str,
+        instance_id: &str,
+        command: &str,
+    ) -> std::result::Result<String, String> {
+        let output = std::process::Command::new("aws")
+            .args([
+                "ssm",
+                "send-command",
+                "--profile",
+                profile,
+                "--region",
+                region,
+                "--instance-ids",
+                instance_id,
+                "--document-name",
+                "AWS-RunShellScript",
+                "--parameters",
+                &format!("commands=[\"{command}\"]"),
+                "--query",
+                "Command.CommandId",
+                "--output",
+                "text",
+            ])
+            .output()
+            .map_err(|e| format!("ssm send-command failed: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("ssm send-command error: {stderr}"));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn ssm_wait_for_command(
+        profile: &str,
+        region: &str,
+        instance_id: &str,
+        command_id: &str,
+    ) -> std::result::Result<String, String> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if Instant::now() > deadline {
+                return Err("ssm command timed out after 30s".to_string());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+            let output = std::process::Command::new("aws")
+                .args([
+                    "ssm",
+                    "get-command-invocation",
+                    "--profile",
+                    profile,
+                    "--region",
+                    region,
+                    "--command-id",
+                    command_id,
+                    "--instance-id",
+                    instance_id,
+                    "--query",
+                    "Status",
+                    "--output",
+                    "text",
+                ])
+                .output()
+                .map_err(|e| format!("ssm get-command-invocation failed: {e}"))?;
+            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            match status.as_str() {
+                "Success" => {
+                    let out = std::process::Command::new("aws")
+                        .args([
+                            "ssm",
+                            "get-command-invocation",
+                            "--profile",
+                            profile,
+                            "--region",
+                            region,
+                            "--command-id",
+                            command_id,
+                            "--instance-id",
+                            instance_id,
+                            "--query",
+                            "StandardOutputContent",
+                            "--output",
+                            "text",
+                        ])
+                        .output()
+                        .map_err(|e| format!("ssm get output failed: {e}"))?;
+                    return Ok(String::from_utf8_lossy(&out.stdout).to_string());
+                }
+                "Failed" | "Cancelled" | "TimedOut" => {
+                    return Err(format!("ssm command ended with status: {status}"));
+                }
+                _ => continue,
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -4021,6 +4872,143 @@ mod gui {
             assert!(fill.r() <= 30);
             assert!(fill.g() <= 30);
             assert!(fill.b() <= 30);
+        }
+
+        #[test]
+        fn parse_ls_output_extracts_files_and_dirs() {
+            let output = "\
+total 24
+drwxr-xr-x 3 user user 4096 Jan 10 12:00 .
+drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
+drwxr-xr-x 2 user user 4096 Jan 10 12:00 config
+-rw-r--r-- 1 user user 1234 Jan 10 12:00 readme.md
+-rw-r--r-- 1 user user  567 Jan 10 12:00 app.py";
+            let entries = parse_ls_output(output);
+            assert_eq!(entries.len(), 3);
+            // dirs first
+            assert!(entries[0].is_dir);
+            assert_eq!(entries[0].name, "config");
+            // then files alphabetically
+            assert!(!entries[1].is_dir);
+            assert_eq!(entries[1].name, "app.py");
+            assert!(!entries[2].is_dir);
+            assert_eq!(entries[2].name, "readme.md");
+        }
+
+        #[test]
+        fn parse_ls_output_skips_dot_entries() {
+            let output = "\
+total 8
+drwxr-xr-x 2 user user 4096 Jan 10 12:00 .
+drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
+-rw-r--r-- 1 user user   42 Jan 10 12:00 file.txt";
+            let entries = parse_ls_output(output);
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].name, "file.txt");
+        }
+
+        #[test]
+        fn parse_ls_output_handles_empty_output() {
+            let entries = parse_ls_output("");
+            assert!(entries.is_empty());
+        }
+
+        #[test]
+        fn parent_path_navigates_up() {
+            assert_eq!(parent_path("/home/user"), "/home");
+            assert_eq!(parent_path("/home"), "/");
+            assert_eq!(parent_path("/"), "/");
+        }
+
+        #[test]
+        fn join_path_appends_component() {
+            assert_eq!(join_path("/home", "user"), "/home/user");
+            assert_eq!(join_path("/", "etc"), "/etc");
+        }
+
+        #[test]
+        fn file_browser_state_defaults() {
+            let fb = FileBrowserState::default();
+            assert!(matches!(fb.status, FileOpStatus::Idle));
+            assert!(fb.entries.is_empty());
+            assert!(!fb.initialized);
+            assert!(fb.selected_entry.is_none());
+        }
+
+        #[test]
+        fn file_entry_sort_dirs_first() {
+            let mut entries = vec![
+                FileEntry {
+                    name: "zebra.txt".to_string(),
+                    is_dir: false,
+                    size: 100,
+                    permissions: "-rw-r--r--".to_string(),
+                    modified: String::new(),
+                },
+                FileEntry {
+                    name: "alpha_dir".to_string(),
+                    is_dir: true,
+                    size: 4096,
+                    permissions: "drwxr-xr-x".to_string(),
+                    modified: String::new(),
+                },
+                FileEntry {
+                    name: "apple.txt".to_string(),
+                    is_dir: false,
+                    size: 50,
+                    permissions: "-rw-r--r--".to_string(),
+                    modified: String::new(),
+                },
+            ];
+            sort_file_entries(&mut entries);
+            assert_eq!(entries[0].name, "alpha_dir");
+            assert!(entries[0].is_dir);
+            assert_eq!(entries[1].name, "apple.txt");
+            assert_eq!(entries[2].name, "zebra.txt");
+        }
+
+        #[test]
+        fn list_files_local_reads_current_dir() {
+            let cwd = std::env::current_dir().unwrap().to_string_lossy().to_string();
+            let entries = list_files_local(&cwd).unwrap();
+            assert!(
+                entries.iter().any(|e| e.name == "Cargo.toml"),
+                "expected Cargo.toml in {:?}",
+                entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+            );
+        }
+
+        #[test]
+        fn list_files_local_error_on_nonexistent() {
+            let result = list_files_local("/nonexistent_path_that_does_not_exist_12345");
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn base64_roundtrip() {
+            use base64::Engine;
+            let original = b"Hello, file browser! \x00\xff\xfe";
+            let encoded = base64::engine::general_purpose::STANDARD.encode(original);
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&encoded)
+                .unwrap();
+            assert_eq!(&decoded, original);
+        }
+
+        #[test]
+        fn file_browser_cleanup_on_tab_close() {
+            let mut browsers: HashMap<u64, FileBrowserState> = HashMap::new();
+            browsers.insert(
+                42,
+                FileBrowserState {
+                    current_path: "/tmp".to_string(),
+                    path_input: "/tmp".to_string(),
+                    ..Default::default()
+                },
+            );
+            assert!(browsers.contains_key(&42));
+            browsers.remove(&42);
+            assert!(!browsers.contains_key(&42));
         }
     }
 }
