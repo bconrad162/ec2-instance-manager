@@ -22,6 +22,7 @@ pub struct AppConfig {
     pub saved_filters: BTreeMap<String, Vec<SavedFilter>>,
     pub port_forward_presets: Vec<PortForwardPreset>,
     pub theme: Option<String>,
+    pub scroll_sensitivity: Option<f32>,
 }
 
 impl Default for AppConfig {
@@ -48,6 +49,7 @@ impl Default for AppConfig {
                 },
             ],
             theme: None,
+            scroll_sensitivity: None,
         }
     }
 }
@@ -324,6 +326,11 @@ impl AppConfig {
                         Some(value.to_string())
                     };
                 }
+                "scroll_sensitivity" => {
+                    if let Ok(val) = value.parse::<f32>() {
+                        cfg.scroll_sensitivity = Some(val);
+                    }
+                }
                 _ => {}
             }
         }
@@ -350,6 +357,10 @@ impl AppConfig {
 
         if let Some(theme) = &self.theme {
             lines.push(format!("theme={theme}"));
+        }
+
+        if let Some(val) = self.scroll_sensitivity {
+            lines.push(format!("scroll_sensitivity={val}"));
         }
 
         for (account, region) in &self.account_regions {
@@ -593,6 +604,7 @@ mod tests {
             local_port: 3306,
             remote_port: 3306,
         });
+        cfg.scroll_sensitivity = Some(5.0);
 
         let raw = cfg.to_text();
         let parsed = AppConfig::parse(&raw);
@@ -607,6 +619,7 @@ mod tests {
             .port_forward_presets
             .iter()
             .any(|p| p.name == "mysql"));
+        assert_eq!(parsed.scroll_sensitivity, Some(5.0));
     }
 
     #[test]

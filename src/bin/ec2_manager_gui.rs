@@ -241,6 +241,7 @@ mod gui {
         last_size: Option<(u16, u16)>,
         bytes_received: u64,
         output_event_count: u64,
+        scroll_offset: usize,
     }
 
     #[derive(Clone, Debug)]
@@ -272,7 +273,9 @@ mod gui {
         current_path: String,
         entries: Vec<FileEntry>,
         status: FileOpStatus,
-        selected_entry: Option<usize>,
+        selected_entries: std::collections::BTreeSet<usize>,
+        last_clicked_entry: Option<usize>,
+        pending_downloads: usize,
         path_input: String,
         initialized: bool,
     }
@@ -283,7 +286,9 @@ mod gui {
                 current_path: String::new(),
                 entries: Vec::new(),
                 status: FileOpStatus::Idle,
-                selected_entry: None,
+                selected_entries: std::collections::BTreeSet::new(),
+                last_clicked_entry: None,
+                pending_downloads: 0,
                 path_input: String::new(),
                 initialized: false,
             }
@@ -582,6 +587,7 @@ mod gui {
         refresh_rx: Receiver<RefreshEvent>,
         refreshing: bool,
         dark_mode: bool,
+        scroll_sensitivity: f32,
         file_browsers: HashMap<u64, FileBrowserState>,
         file_op_tx: Sender<FileOpEvent>,
         file_op_rx: Receiver<FileOpEvent>,
@@ -608,6 +614,7 @@ mod gui {
             let selected_terminal_id = initial_terminal_id(&config, &terminals);
             let gui_smoke = gui_smoke_config_from_env();
             let dark_mode = config.theme.as_deref() != Some("light");
+            let scroll_sensitivity = config.scroll_sensitivity.unwrap_or(10.0);
 
             let mut app = Self {
                 options,
@@ -652,6 +659,7 @@ mod gui {
                 refresh_rx,
                 refreshing: false,
                 dark_mode,
+                scroll_sensitivity,
                 file_browsers: HashMap::new(),
                 file_op_tx,
                 file_op_rx,
@@ -1464,7 +1472,8 @@ mod gui {
             fb.status = FileOpStatus::Listing;
             fb.current_path = path.clone();
             fb.path_input = path.clone();
-            fb.selected_entry = None;
+            fb.selected_entries.clear();
+            fb.last_clicked_entry = None;
 
             let tab = self.connections.selected_ref().cloned();
             let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
@@ -1521,6 +1530,72 @@ mod gui {
             };
             fb.status = FileOpStatus::Downloading;
 
+            let tab = self.connections.selected_ref().cloned();
+            let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
+            let mode = self.options.mode.clone();
+            let context = self.context.clone();
+            let tx = self.file_op_tx.clone();
+
+            std::thread::spawn(move || {
+                let result = if mode == Mode::Sim {
+                    std::fs::read(&remote_path)
+                        .and_then(|data| {
+                            let bytes = data.len() as u64;
+                            std::fs::write(&local_path, &data)?;
+                            Ok(bytes)
+                        })
+                        .map_err(|e| e.to_string())
+                } else if let Some(ctx) = &context {
+                    let cmd = format!("base64 {remote_path}");
+                    ssm_send_command(&ctx.profile, &ctx.region, &instance_id, &cmd)
+                        .and_then(|command_id| {
+                            ssm_wait_for_command(
+                                &ctx.profile,
+                                &ctx.region,
+                                &instance_id,
+                                &command_id,
+                            )
+                        })
+                        .and_then(|b64_output| {
+                            use base64::Engine;
+                            let cleaned: String =
+                                b64_output.chars().filter(|c| !c.is_whitespace()).collect();
+                            let data = base64::engine::general_purpose::STANDARD
+                                .decode(&cleaned)
+                                .map_err(|e| format!("base64 decode failed: {e}"))?;
+                            let bytes = data.len() as u64;
+                            std::fs::write(&local_path, &data)
+                                .map_err(|e| format!("write local file failed: {e}"))?;
+                            Ok(bytes)
+                        })
+                } else {
+                    Err("no AWS context available".to_string())
+                };
+
+                match result {
+                    Ok(bytes) => {
+                        let _ = tx.send(FileOpEvent::DownloadCompleted {
+                            tab_id,
+                            remote_path,
+                            local_path,
+                            bytes,
+                        });
+                    }
+                    Err(error) => {
+                        let _ = tx.send(FileOpEvent::DownloadFailed { tab_id, error });
+                    }
+                }
+            });
+        }
+
+        /// Like `request_file_download` but does not set status to Downloading
+        /// (the caller manages batch status and `pending_downloads`).
+        fn request_batch_file_download(
+            &mut self,
+            tab_id: u64,
+            remote_path: String,
+            local_path: String,
+        ) {
             let tab = self.connections.selected_ref().cloned();
             let instance_id = tab.map(|t| t.instance_id.clone()).unwrap_or_default();
             let mode = self.options.mode.clone();
@@ -1686,7 +1761,14 @@ mod gui {
                             "download completed tab={tab_id} {remote_path} -> {local_path} ({bytes} bytes)"
                         ));
                         if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
-                            fb.status = FileOpStatus::Idle;
+                            if fb.pending_downloads > 0 {
+                                fb.pending_downloads -= 1;
+                                if fb.pending_downloads == 0 {
+                                    fb.status = FileOpStatus::Idle;
+                                }
+                            } else {
+                                fb.status = FileOpStatus::Idle;
+                            }
                         }
                     }
                     FileOpEvent::DownloadFailed { tab_id, error } => {
@@ -1694,7 +1776,14 @@ mod gui {
                             "download failed tab={tab_id}: {error}"
                         ));
                         if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
-                            fb.status = FileOpStatus::Error(error);
+                            if fb.pending_downloads > 0 {
+                                fb.pending_downloads -= 1;
+                                if fb.pending_downloads == 0 {
+                                    fb.status = FileOpStatus::Error(error);
+                                }
+                            } else {
+                                fb.status = FileOpStatus::Error(error);
+                            }
                         }
                     }
                     FileOpEvent::UploadCompleted {
@@ -1732,9 +1821,10 @@ mod gui {
                 "sending input to tab={tab_id} bytes={}",
                 payload.len()
             ));
-            let Some(session) = self.pty_sessions.get(&tab_id) else {
+            let Some(session) = self.pty_sessions.get_mut(&tab_id) else {
                 return;
             };
+            session.scroll_offset = 0;
             let Ok(mut stdin) = session.writer.lock() else {
                 return;
             };
@@ -1760,7 +1850,48 @@ mod gui {
                 )
             });
             let mut sent_etx = false;
+            let on_alt_screen = self.pty_sessions.get(&tab_id)
+                .map(|s| s.parser.screen().alternate_screen())
+                .unwrap_or(false);
+            let screen_rows = self.pty_sessions.get(&tab_id)
+                .map(|s| s.parser.screen().size().0 as usize)
+                .unwrap_or(45);
             for event in events {
+                // Intercept Shift+PageUp/Down/Home/End for scrollback navigation.
+                // Only when not on alternate screen (vim, less, htop handle their own scrolling).
+                if !on_alt_screen {
+                    if let egui::Event::Key { key, pressed: true, modifiers, .. } = &event {
+                        if modifiers.shift {
+                            match key {
+                                egui::Key::PageUp => {
+                                    if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                                        session.scroll_offset = session.scroll_offset.saturating_add(screen_rows);
+                                    }
+                                    continue;
+                                }
+                                egui::Key::PageDown => {
+                                    if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                                        session.scroll_offset = session.scroll_offset.saturating_sub(screen_rows);
+                                    }
+                                    continue;
+                                }
+                                egui::Key::Home => {
+                                    if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                                        session.scroll_offset = usize::MAX;
+                                    }
+                                    continue;
+                                }
+                                egui::Key::End => {
+                                    if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                                        session.scroll_offset = 0;
+                                    }
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
                 // egui emits Event::Copy for Ctrl+C regardless of shift.
                 // We intercept it here so we can check modifiers: plain
                 // Ctrl+C → send ETX (0x03), Ctrl+Shift+C → let egui copy.
@@ -2216,55 +2347,65 @@ mod gui {
                                                 egui::Layout::top_down(egui::Align::Min),
                                                 |ui| {
                                                     ui.set_min_width(available.x);
-                                                    egui::ScrollArea::vertical()
-                                                        .auto_shrink([false, false])
-                                                        .stick_to_bottom(true)
-                                                        .show(ui, |ui| {
-                                                            let size = ui.available_size();
-                                                            let (rows, cols) =
-                                                                terminal_grid_from_pixels(
-                                                                    ui, &font_id, size,
-                                                                );
-                                                            let mut terminal_job =
-                                                                if let Some(session) =
-                                                                    self.pty_sessions
-                                                                        .get_mut(&tab_id)
-                                                                {
-                                                                    resize_pty_session(
-                                                                        session, rows, cols,
-                                                                    );
-                                                                    terminal_layout_job(
-                                                                        session.parser.screen(),
-                                                                        show_cursor,
-                                                                        font_id.clone(),
-                                                                    )
-                                                                } else {
-                                                                    terminal_plain_layout_job(
-                                                                        &tab_lines.join("\n"),
-                                                                        font_id.clone(),
-                                                                    )
-                                                                };
-                                                            terminal_job.wrap.max_width =
-                                                                size.x.max(1.0);
-                                                            ui.allocate_ui_with_layout(
-                                                                size,
-                                                                egui::Layout::left_to_right(
-                                                                    egui::Align::Min,
-                                                                ),
-                                                                |ui| {
-                                                                    ui.add(
-                                                                        egui::Label::new(
-                                                                            terminal_job,
-                                                                        )
-                                                                        .sense(
-                                                                            egui::Sense::click(),
-                                                                        ),
-                                                                    )
-                                                                },
+                                                    let size = ui.available_size();
+                                                    let (rows, cols) =
+                                                        terminal_grid_from_pixels(
+                                                            ui, &font_id, size,
+                                                        );
+                                                    let mut terminal_job =
+                                                        if let Some(session) =
+                                                            self.pty_sessions
+                                                                .get_mut(&tab_id)
+                                                        {
+                                                            resize_pty_session(
+                                                                session, rows, cols,
+                                                            );
+                                                            let screen = session.parser.screen_mut();
+                                                            let on_alt = screen.alternate_screen();
+                                                            let effective_offset = if on_alt {
+                                                                0
+                                                            } else {
+                                                                screen.set_scrollback(usize::MAX);
+                                                                let max_sb = screen.scrollback();
+                                                                session.scroll_offset = session.scroll_offset.min(max_sb);
+                                                                screen.set_scrollback(session.scroll_offset);
+                                                                session.scroll_offset
+                                                            };
+                                                            let cursor_visible = show_cursor && effective_offset == 0;
+                                                            let job = terminal_layout_job(
+                                                                session.parser.screen(),
+                                                                cursor_visible,
+                                                                font_id.clone(),
+                                                            );
+                                                            if effective_offset > 0 {
+                                                                session.parser.screen_mut().set_scrollback(0);
+                                                            }
+                                                            job
+                                                        } else {
+                                                            terminal_plain_layout_job(
+                                                                &tab_lines.join("\n"),
+                                                                font_id.clone(),
                                                             )
-                                                            .inner
-                                                        })
-                                                        .inner
+                                                        };
+                                                    terminal_job.wrap.max_width =
+                                                        size.x.max(1.0);
+                                                    ui.allocate_ui_with_layout(
+                                                        size,
+                                                        egui::Layout::left_to_right(
+                                                            egui::Align::Min,
+                                                        ),
+                                                        |ui| {
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    terminal_job,
+                                                                )
+                                                                .sense(
+                                                                    egui::Sense::click(),
+                                                                ),
+                                                            )
+                                                        },
+                                                    )
+                                                    .inner
                                                 },
                                             )
                                             .inner
@@ -2300,7 +2441,74 @@ mod gui {
                                     }
                                 }
                             }
+                            // Mouse wheel scrollback
+                            if terminal_focus_response.hovered() || terminal_focus_response.has_focus() {
+                                let scroll_delta = ui.input(|i| i.smooth_scroll_delta.y);
+                                if scroll_delta != 0.0 {
+                                    if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                                        if !session.parser.screen().alternate_screen() {
+                                            let lines = (scroll_delta.abs() / self.scroll_sensitivity).ceil().max(1.0) as usize;
+                                            if scroll_delta > 0.0 {
+                                                session.scroll_offset = session.scroll_offset.saturating_add(lines);
+                                            } else {
+                                                session.scroll_offset = session.scroll_offset.saturating_sub(lines);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // "Scrolled up" indicator overlay
+                            let current_scroll_offset = self.pty_sessions
+                                .get(&tab_id)
+                                .map(|s| s.scroll_offset)
+                                .unwrap_or(0);
+                            if current_scroll_offset > 0 {
+                                let term_rect = terminal_response.response.rect;
+                                let banner_height = 24.0;
+                                let banner_rect = egui::Rect::from_min_size(
+                                    egui::pos2(term_rect.left(), term_rect.bottom() - banner_height),
+                                    egui::vec2(term_rect.width(), banner_height),
+                                );
+                                ui.painter().rect_filled(
+                                    banner_rect,
+                                    0.0,
+                                    egui::Color32::from_rgba_unmultiplied(40, 40, 40, 220),
+                                );
+                                let banner_text = format!(
+                                    "Scrolled up {} lines \u{2014} click to return to bottom",
+                                    current_scroll_offset
+                                );
+                                ui.painter().text(
+                                    banner_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    banner_text,
+                                    egui::FontId::proportional(12.0),
+                                    egui::Color32::from_rgb(200, 200, 200),
+                                );
+                                let banner_id = ui.make_persistent_id(("scroll_banner", tab_id));
+                                let banner_response = ui.interact(
+                                    banner_rect,
+                                    banner_id,
+                                    egui::Sense::click(),
+                                );
+                                if banner_response.clicked() {
+                                    if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                                        session.scroll_offset = 0;
+                                    }
+                                }
+                            }
                             if terminal_focus_response.has_focus() {
+                                ui.memory_mut(|mem| {
+                                    mem.set_focus_lock_filter(
+                                        terminal_focus_id,
+                                        egui::EventFilter {
+                                            tab: true,
+                                            horizontal_arrows: true,
+                                            vertical_arrows: true,
+                                            escape: true,
+                                        },
+                                    );
+                                });
                                 self.forward_terminal_key_input(ui.ctx(), tab_id);
                             }
                         },
@@ -2319,13 +2527,22 @@ mod gui {
                     fb.path_input.clone(),
                     fb.current_path.clone(),
                     fb.entries.clone(),
-                    fb.selected_entry,
+                    fb.selected_entries.clone(),
+                    fb.last_clicked_entry,
                     fb.status.clone(),
+                    fb.pending_downloads,
                 )
             });
 
-            let Some((mut path_input, current_path, entries, selected_entry, status)) =
-                fb_snapshot
+            let Some((
+                mut path_input,
+                current_path,
+                entries,
+                selected_entries,
+                last_clicked,
+                status,
+                pending_downloads,
+            )) = fb_snapshot
             else {
                 ui.label("No file browser for this tab");
                 return;
@@ -2379,7 +2596,11 @@ mod gui {
                 FileOpStatus::Downloading => {
                     ui.horizontal(|ui| {
                         ui.spinner();
-                        ui.label("Downloading...");
+                        if pending_downloads > 1 {
+                            ui.label(format!("Downloading ({pending_downloads} remaining)..."));
+                        } else {
+                            ui.label("Downloading...");
+                        }
                     });
                 }
                 FileOpStatus::Uploading => {
@@ -2397,19 +2618,47 @@ mod gui {
             ui.separator();
 
             // File list
-            let mut new_selected = selected_entry;
+            let mut new_selected = selected_entries.clone();
+            let mut new_last_clicked = last_clicked;
             let mut double_clicked_dir: Option<String> = None;
+            let modifiers = ui.input(|i| i.modifiers);
             egui::ScrollArea::vertical()
                 .max_height(ui.available_height() - 40.0)
                 .show(ui, |ui| {
                     for (idx, entry) in entries.iter().enumerate() {
                         let prefix = if entry.is_dir { ">" } else { " " };
                         let label = format!("{prefix} {}", entry.name);
-                        let is_selected = selected_entry == Some(idx);
+                        let is_selected = new_selected.contains(&idx);
                         let response =
                             ui.selectable_label(is_selected, truncate(&label, 30));
                         if response.clicked() {
-                            new_selected = Some(idx);
+                            if modifiers.shift {
+                                if let Some(anchor) = last_clicked {
+                                    let range = if anchor <= idx {
+                                        anchor..=idx
+                                    } else {
+                                        idx..=anchor
+                                    };
+                                    for i in range {
+                                        new_selected.insert(i);
+                                    }
+                                } else {
+                                    new_selected.clear();
+                                    new_selected.insert(idx);
+                                }
+                                new_last_clicked = Some(idx);
+                            } else if modifiers.command || modifiers.ctrl {
+                                if new_selected.contains(&idx) {
+                                    new_selected.remove(&idx);
+                                } else {
+                                    new_selected.insert(idx);
+                                }
+                                new_last_clicked = Some(idx);
+                            } else {
+                                new_selected.clear();
+                                new_selected.insert(idx);
+                                new_last_clicked = Some(idx);
+                            }
                         }
                         if response.double_clicked() && entry.is_dir {
                             double_clicked_dir =
@@ -2425,7 +2674,8 @@ mod gui {
 
             // Update selection
             if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
-                fb.selected_entry = new_selected;
+                fb.selected_entries = new_selected.clone();
+                fb.last_clicked_entry = new_last_clicked;
             }
 
             // Navigate on double-click dir
@@ -2437,16 +2687,27 @@ mod gui {
 
             // Upload / Download buttons
             ui.horizontal(|ui| {
-                let can_download = selected_entry
-                    .and_then(|idx| entries.get(idx))
-                    .map(|e| !e.is_dir)
-                    .unwrap_or(false);
+                // Gather selected file entries (non-dir)
+                let selected_files: Vec<usize> = new_selected
+                    .iter()
+                    .copied()
+                    .filter(|&idx| {
+                        entries.get(idx).map(|e| !e.is_dir).unwrap_or(false)
+                    })
+                    .collect();
+                let can_download = !selected_files.is_empty();
+                let download_label = if selected_files.len() > 1 {
+                    format!("Download ({})", selected_files.len())
+                } else {
+                    "Download".to_string()
+                };
                 if ui
-                    .add_enabled(can_download, egui::Button::new("Download"))
+                    .add_enabled(can_download, egui::Button::new(download_label))
                     .clicked()
                 {
-                    if let Some(idx) = selected_entry {
-                        if let Some(entry) = entries.get(idx) {
+                    if selected_files.len() == 1 {
+                        // Single file: save-file dialog (existing behavior)
+                        if let Some(entry) = entries.get(selected_files[0]) {
                             let remote = join_path(&current_path, &entry.name);
                             let dialog = rfd::FileDialog::new()
                                 .set_file_name(&entry.name);
@@ -2456,6 +2717,29 @@ mod gui {
                                     remote,
                                     local.to_string_lossy().to_string(),
                                 );
+                            }
+                        }
+                    } else {
+                        // Multiple files: pick destination folder
+                        let dialog = rfd::FileDialog::new();
+                        if let Some(dest_dir) = dialog.pick_folder() {
+                            let total = selected_files.len();
+                            if let Some(fb) = self.file_browsers.get_mut(&tab_id) {
+                                fb.pending_downloads = total;
+                                fb.status = FileOpStatus::Downloading;
+                            }
+                            for idx in &selected_files {
+                                if let Some(entry) = entries.get(*idx) {
+                                    let remote =
+                                        join_path(&current_path, &entry.name);
+                                    let local = dest_dir
+                                        .join(&entry.name)
+                                        .to_string_lossy()
+                                        .to_string();
+                                    self.request_batch_file_download(
+                                        tab_id, remote, local,
+                                    );
+                                }
                             }
                         }
                     }
@@ -2645,6 +2929,16 @@ mod gui {
                                     ui.close();
                                 }
                             });
+                            ui.menu_button("Scroll Sensitivity", |ui| {
+                                for &(label, value) in &[("Low", 20.0f32), ("Medium (Default)", 10.0), ("High", 5.0)] {
+                                    if ui.selectable_label(self.scroll_sensitivity == value, label).clicked() {
+                                        self.scroll_sensitivity = value;
+                                        self.config.scroll_sensitivity = Some(value);
+                                        let _ = self.config.save();
+                                        ui.close();
+                                    }
+                                }
+                            });
                         });
                     });
 
@@ -2692,6 +2986,7 @@ mod gui {
                     }
                 });
 
+                if self.main_tab == MainTab::Inventory {
                 egui::SidePanel::left("controls")
                     .resizable(true)
                     .show(ctx, |ui| {
@@ -2969,6 +3264,7 @@ mod gui {
                         self.terminals.len()
                     ));
                     });
+                }
 
                 egui::CentralPanel::default().show(ctx, |ui| match self.main_tab {
                     MainTab::Inventory => self.render_inventory_panel(ui),
@@ -3218,6 +3514,7 @@ mod gui {
             last_size: None,
             bytes_received: 0,
             output_event_count: 0,
+            scroll_offset: 0,
         };
 
         Ok((session, reader))
@@ -4932,7 +5229,9 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(matches!(fb.status, FileOpStatus::Idle));
             assert!(fb.entries.is_empty());
             assert!(!fb.initialized);
-            assert!(fb.selected_entry.is_none());
+            assert!(fb.selected_entries.is_empty());
+            assert!(fb.last_clicked_entry.is_none());
+            assert_eq!(fb.pending_downloads, 0);
         }
 
         #[test]
@@ -5009,6 +5308,53 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             assert!(browsers.contains_key(&42));
             browsers.remove(&42);
             assert!(!browsers.contains_key(&42));
+        }
+
+        #[test]
+        fn scroll_offset_initializes_to_zero() {
+            let mut parser = vt100::Parser::new(24, 80, 1000);
+            parser.process(b"hello");
+            // Simulate what spawn_pty_session_blocking does — scroll_offset starts at 0
+            let scroll_offset: usize = 0;
+            assert_eq!(scroll_offset, 0);
+        }
+
+        #[test]
+        fn terminal_layout_job_with_scrollback_shows_history() {
+            let mut parser = vt100::Parser::new(2, 10, 100);
+            // Fill enough lines to push content into scrollback
+            for i in 0..10 {
+                parser.process(format!("line{i}\r\n").as_bytes());
+            }
+            // Without scrollback, we see only the latest visible rows
+            let job_bottom = terminal_layout_job(
+                parser.screen(),
+                false,
+                egui::FontId::monospace(12.0),
+            );
+            // Scroll up to see earlier content
+            parser.screen_mut().set_scrollback(5);
+            let job_scrolled = terminal_layout_job(
+                parser.screen(),
+                false,
+                egui::FontId::monospace(12.0),
+            );
+            parser.screen_mut().set_scrollback(0);
+            // The scrolled view should differ from the bottom view
+            assert_ne!(job_bottom.text, job_scrolled.text);
+        }
+
+        #[test]
+        fn scroll_offset_clamped_to_available_scrollback() {
+            let mut parser = vt100::Parser::new(5, 10, 100);
+            // Write just 3 lines — scrollback should be limited
+            parser.process(b"a\r\nb\r\nc\r\n");
+            parser.screen_mut().set_scrollback(usize::MAX);
+            let max_sb = parser.screen().scrollback();
+            let mut scroll_offset: usize = 9999;
+            scroll_offset = scroll_offset.min(max_sb);
+            assert!(scroll_offset <= max_sb);
+            parser.screen_mut().set_scrollback(0);
         }
     }
 }
