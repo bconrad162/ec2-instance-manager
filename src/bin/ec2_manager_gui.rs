@@ -244,6 +244,34 @@ mod gui {
         scroll_offset: usize,
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct TerminalSelection {
+        anchor: Option<(u16, u16)>, // (row, col) where drag started
+        end: Option<(u16, u16)>,    // (row, col) where drag is now
+    }
+
+    impl TerminalSelection {
+        /// Returns (start, end) with start <= end in reading order.
+        fn normalized(&self) -> Option<((u16, u16), (u16, u16))> {
+            let a = self.anchor?;
+            let e = self.end?;
+            if a.0 < e.0 || (a.0 == e.0 && a.1 <= e.1) {
+                Some((a, e))
+            } else {
+                Some((e, a))
+            }
+        }
+
+        fn is_active(&self) -> bool {
+            self.anchor.is_some() && self.end.is_some()
+        }
+
+        fn clear(&mut self) {
+            self.anchor = None;
+            self.end = None;
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct PtyCommand {
         program: String,
@@ -581,6 +609,7 @@ mod gui {
         last_profile_poll_at: Instant,
         connections: ConnectionTabs,
         pty_sessions: HashMap<u64, PtySession>,
+        terminal_selections: HashMap<u64, TerminalSelection>,
         proc_tx: Sender<ProcEvent>,
         proc_rx: Receiver<ProcEvent>,
         refresh_tx: Sender<RefreshEvent>,
@@ -653,6 +682,7 @@ mod gui {
                 last_profile_poll_at: Instant::now(),
                 connections: ConnectionTabs::new(),
                 pty_sessions: HashMap::new(),
+                terminal_selections: HashMap::new(),
                 proc_tx,
                 proc_rx,
                 refresh_tx,
@@ -1244,6 +1274,14 @@ mod gui {
                             let evt = session.output_event_count;
                             let total = session.bytes_received;
                             session.parser.process(&bytes);
+                            // Clear selection when new output arrives and user is at bottom
+                            if session.scroll_offset == 0 {
+                                if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                                    if sel.is_active() {
+                                        sel.clear();
+                                    }
+                                }
+                            }
                             // Respond to Device Status Report queries (ESC[6n =
                             // cursor position request).  CMD and PowerShell send
                             // this at startup and block until they receive the
@@ -1354,6 +1392,7 @@ mod gui {
                     }
                 }
                 self.pty_sessions.remove(&tab_id);
+                self.terminal_selections.remove(&tab_id);
                 let _ = self.proc_tx.send(ProcEvent::Exited { tab_id, code });
             }
         }
@@ -1461,6 +1500,7 @@ mod gui {
                 });
             }
             self.file_browsers.remove(&tab_id);
+            self.terminal_selections.remove(&tab_id);
             self.connections.close(tab_id);
             self.log_info(format!("closed connection tab id={tab_id}"));
         }
@@ -1896,7 +1936,34 @@ mod gui {
                 // We intercept it here so we can check modifiers: plain
                 // Ctrl+C → send ETX (0x03), Ctrl+Shift+C → let egui copy.
                 if matches!(event, egui::Event::Copy) {
-                    if !current_modifiers.shift && !sent_etx {
+                    if current_modifiers.shift {
+                        // Ctrl+Shift+C: copy selected terminal text
+                        let sel = self.terminal_selections.get(&tab_id).cloned();
+                        if let Some(sel) = sel {
+                            if let Some(((sr, sc), (er, ec))) = sel.normalized() {
+                                if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                                    let prev_sb = session.scroll_offset;
+                                    session.parser.screen_mut().set_scrollback(prev_sb);
+                                    let text = session.parser.screen().contents_between(
+                                        sr, sc, er, ec + 1,
+                                    );
+                                    session.parser.screen_mut().set_scrollback(0);
+                                    if !text.is_empty() {
+                                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                            let _ = clipboard.set_text(&text);
+                                        }
+                                        self.log_debug(format!(
+                                            "copied selection tab={tab_id} ({sr},{sc})-({er},{ec}) len={}",
+                                            text.len()
+                                        ));
+                                    }
+                                }
+                                if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                                    sel.clear();
+                                }
+                            }
+                        }
+                    } else if !sent_etx {
                         self.log_trace(format!(
                             "terminal input event tab={tab_id} kind=Copy→ETX"
                         ));
@@ -2348,8 +2415,8 @@ mod gui {
                                                 |ui| {
                                                     ui.set_min_width(available.x);
                                                     let size = ui.available_size();
-                                                    let (rows, cols) =
-                                                        terminal_grid_from_pixels(
+                                                    let (rows, cols, _cell_w, _cell_h) =
+                                                        terminal_grid_and_cell_size(
                                                             ui, &font_id, size,
                                                         );
                                                     let mut terminal_job =
@@ -2417,13 +2484,55 @@ mod gui {
                             let terminal_focus_response = ui.interact(
                                 terminal_response.response.rect,
                                 terminal_focus_id,
-                                egui::Sense::click(),
+                                egui::Sense::click_and_drag(),
                             );
-                            if terminal_focus_response.clicked() {
+                            let term_rect = terminal_response.response.rect;
+                            let (sel_rows, sel_cols, sel_cell_w, sel_cell_h) =
+                                terminal_grid_and_cell_size(ui, &font_id, term_rect.size());
+                            // Mouse drag selection
+                            if terminal_focus_response.drag_started_by(egui::PointerButton::Primary) {
+                                if let Some(pos) = terminal_focus_response.interact_pointer_pos() {
+                                    let cell = pixel_to_grid_cell(pos, term_rect, sel_cell_w, sel_cell_h, sel_rows, sel_cols);
+                                    let sel = self.terminal_selections.entry(tab_id).or_default();
+                                    sel.anchor = Some(cell);
+                                    sel.end = Some(cell);
+                                }
+                                terminal_focus_response.request_focus();
+                            } else if terminal_focus_response.dragged_by(egui::PointerButton::Primary) {
+                                if let Some(pos) = terminal_focus_response.interact_pointer_pos() {
+                                    let cell = pixel_to_grid_cell(pos, term_rect, sel_cell_w, sel_cell_h, sel_rows, sel_cols);
+                                    if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                                        sel.end = Some(cell);
+                                    }
+                                }
+                            } else if terminal_focus_response.clicked() {
+                                if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                                    sel.clear();
+                                }
                                 terminal_focus_response.request_focus();
                                 self.log_debug(format!(
                                     "terminal focus requested tab={tab_id}"
                                 ));
+                            }
+                            // Draw selection highlight overlay
+                            if let Some(sel) = self.terminal_selections.get(&tab_id) {
+                                if let Some(((sr, sc), (er, ec))) = sel.normalized() {
+                                    let painter = ui.painter();
+                                    let highlight = egui::Color32::from_rgba_unmultiplied(60, 120, 220, 100);
+                                    for r in sr..=er {
+                                        let col_start = if r == sr { sc } else { 0 };
+                                        let col_end = if r == er { ec } else { sel_cols.saturating_sub(1) };
+                                        let x0 = term_rect.left() + col_start as f32 * sel_cell_w;
+                                        let y0 = term_rect.top() + r as f32 * sel_cell_h;
+                                        let x1 = term_rect.left() + (col_end as f32 + 1.0) * sel_cell_w;
+                                        let y1 = y0 + sel_cell_h;
+                                        painter.rect_filled(
+                                            egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
+                                            0.0,
+                                            highlight,
+                                        );
+                                    }
+                                }
                             }
                             if terminal_focus_response.secondary_clicked() {
                                 if let Ok(mut clipboard) = arboard::Clipboard::new() {
@@ -3817,11 +3926,11 @@ mod gui {
         egui::text::LayoutJob::single_section(text.to_string(), format)
     }
 
-    fn terminal_grid_from_pixels(
+    fn terminal_grid_and_cell_size(
         ui: &egui::Ui,
         font_id: &egui::FontId,
         available: egui::Vec2,
-    ) -> (u16, u16) {
+    ) -> (u16, u16, f32, f32) {
         let (cell_w, cell_h) = ui.fonts_mut(|f| {
             (f.glyph_width(font_id, 'W'), f.row_height(font_id))
         });
@@ -3829,7 +3938,22 @@ mod gui {
         let cell_h = if cell_h >= 1.0 { cell_h } else { font_id.size * 1.2 };
         let cols = (available.x / cell_w).floor().max(1.0) as u16;
         let rows = (available.y / cell_h).floor().max(1.0) as u16;
-        (rows, cols)
+        (rows, cols, cell_w, cell_h)
+    }
+
+    fn pixel_to_grid_cell(
+        pos: egui::Pos2,
+        rect: egui::Rect,
+        cell_w: f32,
+        cell_h: f32,
+        rows: u16,
+        cols: u16,
+    ) -> (u16, u16) {
+        let x = pos.x - rect.left();
+        let y = pos.y - rect.top();
+        let col = (x / cell_w).floor().max(0.0) as u16;
+        let row = (y / cell_h).floor().max(0.0) as u16;
+        (row.min(rows.saturating_sub(1)), col.min(cols.saturating_sub(1)))
     }
 
     fn resize_pty_session(session: &mut PtySession, rows: u16, cols: u16) {
@@ -3980,7 +4104,15 @@ mod gui {
                     Some(text.as_bytes().to_vec())
                 }
             }
-            egui::Event::Paste(text) => Some(text.as_bytes().to_vec()),
+            egui::Event::Paste(text) => {
+                // Wrap pasted text in bracketed-paste escape sequences so
+                // applications like vim know it is a paste (avoids auto-indent
+                // and auto-comment artifacts).
+                let mut buf = b"\x1b[200~".to_vec();
+                buf.extend_from_slice(text.as_bytes());
+                buf.extend_from_slice(b"\x1b[201~");
+                Some(buf)
+            }
             // Copy/Cut events carry no modifier info so we cannot
             // distinguish Ctrl+C from Ctrl+Shift+C here.  These are
             // handled in forward_terminal_key_input instead.
@@ -4008,6 +4140,9 @@ mod gui {
                 egui::Key::L if modifiers.ctrl => Some(vec![0x0c]),
                 egui::Key::U if modifiers.ctrl => Some(vec![0x15]),
                 egui::Key::W if modifiers.ctrl => Some(vec![0x17]),
+                _ if modifiers.ctrl && !modifiers.shift && !modifiers.alt => {
+                    ctrl_key_byte(*key).map(|b| vec![b])
+                }
                 _ if !modifiers.ctrl && !modifiers.command && !modifiers.alt => {
                     if has_text {
                         None
@@ -4031,6 +4166,38 @@ mod gui {
             egui::Event::PointerButton { .. } => "pointer_button".to_string(),
             egui::Event::PointerMoved(_) => "pointer_moved".to_string(),
             _ => "other".to_string(),
+        }
+    }
+
+    fn ctrl_key_byte(key: egui::Key) -> Option<u8> {
+        match key {
+            egui::Key::A => Some(0x01),
+            egui::Key::B => Some(0x02),
+            egui::Key::C => Some(0x03),
+            egui::Key::D => Some(0x04),
+            egui::Key::E => Some(0x05),
+            egui::Key::F => Some(0x06),
+            egui::Key::G => Some(0x07),
+            egui::Key::H => Some(0x08),
+            egui::Key::I => Some(0x09),
+            egui::Key::J => Some(0x0a),
+            egui::Key::K => Some(0x0b),
+            egui::Key::L => Some(0x0c),
+            egui::Key::M => Some(0x0d),
+            egui::Key::N => Some(0x0e),
+            egui::Key::O => Some(0x0f),
+            egui::Key::P => Some(0x10),
+            egui::Key::Q => Some(0x11),
+            egui::Key::R => Some(0x12),
+            egui::Key::S => Some(0x13),
+            egui::Key::T => Some(0x14),
+            egui::Key::U => Some(0x15),
+            egui::Key::V => Some(0x16),
+            egui::Key::W => Some(0x17),
+            egui::Key::X => Some(0x18),
+            egui::Key::Y => Some(0x19),
+            egui::Key::Z => Some(0x1a),
+            _ => None,
         }
     }
 
@@ -4972,9 +5139,12 @@ mod gui {
             );
 
             let paste = egui::Event::Paste("echo hi".to_string());
+            let mut expected_paste = b"\x1b[200~".to_vec();
+            expected_paste.extend_from_slice(b"echo hi");
+            expected_paste.extend_from_slice(b"\x1b[201~");
             assert_eq!(
                 terminal_event_payload_for_terminal(&paste, false, false),
-                Some("echo hi".as_bytes().to_vec())
+                Some(expected_paste)
             );
         }
 
@@ -5097,6 +5267,51 @@ mod gui {
             assert_eq!(
                 terminal_event_payload_for_terminal(&ctrl_text, false, false),
                 None
+            );
+        }
+
+        #[test]
+        fn terminal_event_payload_ctrl_a_sends_soh() {
+            let ctrl_a = egui::Event::Key {
+                key: egui::Key::A,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers { ctrl: true, ..Default::default() },
+            };
+            assert_eq!(
+                terminal_event_payload_for_terminal(&ctrl_a, false, false),
+                Some(vec![0x01])
+            );
+        }
+
+        #[test]
+        fn terminal_event_payload_ctrl_e_sends_enq() {
+            let ctrl_e = egui::Event::Key {
+                key: egui::Key::E,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers { ctrl: true, ..Default::default() },
+            };
+            assert_eq!(
+                terminal_event_payload_for_terminal(&ctrl_e, false, false),
+                Some(vec![0x05])
+            );
+        }
+
+        #[test]
+        fn terminal_event_payload_ctrl_r_sends_dc2() {
+            let ctrl_r = egui::Event::Key {
+                key: egui::Key::R,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers { ctrl: true, ..Default::default() },
+            };
+            assert_eq!(
+                terminal_event_payload_for_terminal(&ctrl_r, false, false),
+                Some(vec![0x12])
             );
         }
 
@@ -5355,6 +5570,71 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
             scroll_offset = scroll_offset.min(max_sb);
             assert!(scroll_offset <= max_sb);
             parser.screen_mut().set_scrollback(0);
+        }
+
+        #[test]
+        fn terminal_selection_normalized_orders_correctly() {
+            let sel = TerminalSelection {
+                anchor: Some((5, 10)),
+                end: Some((2, 3)),
+            };
+            let ((sr, sc), (er, ec)) = sel.normalized().unwrap();
+            assert_eq!((sr, sc), (2, 3));
+            assert_eq!((er, ec), (5, 10));
+        }
+
+        #[test]
+        fn terminal_selection_normalized_same_row() {
+            let sel = TerminalSelection {
+                anchor: Some((3, 20)),
+                end: Some((3, 5)),
+            };
+            let ((sr, sc), (er, ec)) = sel.normalized().unwrap();
+            assert_eq!((sr, sc), (3, 5));
+            assert_eq!((er, ec), (3, 20));
+        }
+
+        #[test]
+        fn terminal_selection_clear_removes_state() {
+            let mut sel = TerminalSelection {
+                anchor: Some((1, 2)),
+                end: Some((3, 4)),
+            };
+            assert!(sel.is_active());
+            sel.clear();
+            assert!(!sel.is_active());
+            assert!(sel.normalized().is_none());
+        }
+
+        #[test]
+        fn pixel_to_grid_cell_basic() {
+            let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(800.0, 400.0));
+            let cell_w = 8.0;
+            let cell_h = 16.0;
+            let rows = 25;
+            let cols = 80;
+            // Pixel at (100 + 3*8, 50 + 2*16) = cell (2, 3)
+            let pos = egui::pos2(100.0 + 24.0, 50.0 + 32.0);
+            let (row, col) = pixel_to_grid_cell(pos, rect, cell_w, cell_h, rows, cols);
+            assert_eq!(row, 2);
+            assert_eq!(col, 3);
+        }
+
+        #[test]
+        fn pixel_to_grid_cell_clamps_to_bounds() {
+            let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(640.0, 400.0));
+            let cell_w = 8.0;
+            let cell_h = 16.0;
+            let rows = 25;
+            let cols = 80;
+            // Position above and to the left of the rect
+            let (row, col) = pixel_to_grid_cell(egui::pos2(-50.0, -50.0), rect, cell_w, cell_h, rows, cols);
+            assert_eq!(row, 0);
+            assert_eq!(col, 0);
+            // Position far below and to the right
+            let (row, col) = pixel_to_grid_cell(egui::pos2(9999.0, 9999.0), rect, cell_w, cell_h, rows, cols);
+            assert_eq!(row, rows - 1);
+            assert_eq!(col, cols - 1);
         }
     }
 }
