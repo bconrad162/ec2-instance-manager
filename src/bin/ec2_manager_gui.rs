@@ -534,9 +534,9 @@ mod gui {
                 Box::new(move |cc| {
                     let app = Ec2GuiApp::new(app_options.clone());
                     if app.dark_mode {
-                        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+                        cc.egui_ctx.set_theme(egui::ThemePreference::Dark);
                     } else {
-                        cc.egui_ctx.set_visuals(egui::Visuals::light());
+                        cc.egui_ctx.set_theme(egui::ThemePreference::Light);
                     }
                     Ok(Box::new(app))
                 }),
@@ -2484,28 +2484,33 @@ mod gui {
                             let terminal_focus_response = ui.interact(
                                 terminal_response.response.rect,
                                 terminal_focus_id,
-                                egui::Sense::click_and_drag(),
+                                egui::Sense::click(),
                             );
                             let term_rect = terminal_response.response.rect;
                             let (sel_rows, sel_cols, sel_cell_w, sel_cell_h) =
                                 terminal_grid_and_cell_size(ui, &font_id, term_rect.size());
-                            // Mouse drag selection
-                            if terminal_focus_response.drag_started_by(egui::PointerButton::Primary) {
-                                if let Some(pos) = terminal_focus_response.interact_pointer_pos() {
-                                    let cell = pixel_to_grid_cell(pos, term_rect, sel_cell_w, sel_cell_h, sel_rows, sel_cols);
-                                    let sel = self.terminal_selections.entry(tab_id).or_default();
-                                    sel.anchor = Some(cell);
-                                    sel.end = Some(cell);
-                                }
-                                terminal_focus_response.request_focus();
-                            } else if terminal_focus_response.dragged_by(egui::PointerButton::Primary) {
-                                if let Some(pos) = terminal_focus_response.interact_pointer_pos() {
-                                    let cell = pixel_to_grid_cell(pos, term_rect, sel_cell_w, sel_cell_h, sel_rows, sel_cols);
-                                    if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                            // Mouse drag selection using raw pointer state
+                            let pointer_pos = ui.input(|i| i.pointer.hover_pos());
+                            let primary_down = ui.input(|i| i.pointer.primary_down());
+                            let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
+                            if let Some(pos) = pointer_pos {
+                                if term_rect.contains(pos) {
+                                    if primary_pressed {
+                                        let cell = pixel_to_grid_cell(pos, term_rect, sel_cell_w, sel_cell_h, sel_rows, sel_cols);
+                                        let sel = self.terminal_selections.entry(tab_id).or_default();
+                                        sel.anchor = Some(cell);
                                         sel.end = Some(cell);
+                                    } else if primary_down {
+                                        let cell = pixel_to_grid_cell(pos, term_rect, sel_cell_w, sel_cell_h, sel_rows, sel_cols);
+                                        if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                                            if sel.anchor.is_some() {
+                                                sel.end = Some(cell);
+                                            }
+                                        }
                                     }
                                 }
-                            } else if terminal_focus_response.clicked() {
+                            }
+                            if terminal_focus_response.clicked() {
                                 if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
                                     sel.clear();
                                 }
@@ -3022,7 +3027,7 @@ mod gui {
                                     .clicked()
                                 {
                                     self.dark_mode = true;
-                                    ctx.set_visuals(egui::Visuals::dark());
+                                    ctx.set_theme(egui::ThemePreference::Dark);
                                     self.config.theme = Some("dark".to_string());
                                     let _ = self.config.save();
                                     ui.close();
@@ -3032,7 +3037,7 @@ mod gui {
                                     .clicked()
                                 {
                                     self.dark_mode = false;
-                                    ctx.set_visuals(egui::Visuals::light());
+                                    ctx.set_theme(egui::ThemePreference::Light);
                                     self.config.theme = Some("light".to_string());
                                     let _ = self.config.save();
                                     ui.close();
