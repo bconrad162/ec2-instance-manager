@@ -244,18 +244,28 @@ mod gui {
         scroll_offset: usize,
     }
 
+    /// Absolute terminal position: scroll-invariant coordinate.
+    /// `abs_row` 0 = newest line (bottom at scroll_offset 0), increasing into history.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct AbsPos {
+        abs_row: usize,
+        col: u16,
+    }
+
     #[derive(Clone, Debug, Default)]
     struct TerminalSelection {
-        anchor: Option<(u16, u16)>, // (row, col) where drag started
-        end: Option<(u16, u16)>,    // (row, col) where drag is now
+        anchor: Option<AbsPos>, // where drag started
+        end: Option<AbsPos>,    // where drag is now
     }
 
     impl TerminalSelection {
-        /// Returns (start, end) with start <= end in reading order.
-        fn normalized(&self) -> Option<((u16, u16), (u16, u16))> {
+        /// Returns (start, end) in reading order: start has higher abs_row
+        /// (further into history / top of display), end has lower abs_row
+        /// (closer to present / bottom of display).
+        fn normalized(&self) -> Option<(AbsPos, AbsPos)> {
             let a = self.anchor?;
             let e = self.end?;
-            if a.0 < e.0 || (a.0 == e.0 && a.1 <= e.1) {
+            if a.abs_row > e.abs_row || (a.abs_row == e.abs_row && a.col <= e.col) {
                 Some((a, e))
             } else {
                 Some((e, a))
@@ -1940,21 +1950,18 @@ mod gui {
                         // Ctrl+Shift+C: copy selected terminal text
                         let sel = self.terminal_selections.get(&tab_id).cloned();
                         if let Some(sel) = sel {
-                            if let Some(((sr, sc), (er, ec))) = sel.normalized() {
+                            if let Some((start, end)) = sel.normalized() {
                                 if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
-                                    let prev_sb = session.scroll_offset;
-                                    session.parser.screen_mut().set_scrollback(prev_sb);
-                                    let text = session.parser.screen().contents_between(
-                                        sr, sc, er, ec + 1,
+                                    let text = extract_selection_text(
+                                        &mut session.parser, start, end,
                                     );
-                                    session.parser.screen_mut().set_scrollback(0);
                                     if !text.is_empty() {
                                         if let Ok(mut clipboard) = arboard::Clipboard::new() {
                                             let _ = clipboard.set_text(&text);
                                         }
                                         self.log_debug(format!(
-                                            "copied selection tab={tab_id} ({sr},{sc})-({er},{ec}) len={}",
-                                            text.len()
+                                            "copied selection tab={tab_id} abs ({},{})→({},{}) len={}",
+                                            start.abs_row, start.col, end.abs_row, end.col, text.len()
                                         ));
                                     }
                                 }
@@ -2466,6 +2473,7 @@ mod gui {
                                                                 egui::Label::new(
                                                                     terminal_job,
                                                                 )
+                                                                .selectable(false)
                                                                 .sense(
                                                                     egui::Sense::click(),
                                                                 ),
@@ -2486,25 +2494,80 @@ mod gui {
                                 terminal_focus_id,
                                 egui::Sense::click(),
                             );
-                            let term_rect = terminal_response.response.rect;
+                            // Shrink by the outer frame's inner_margin(4) so highlight
+                            // and mouse mapping align with the actual text content area.
+                            let term_rect = terminal_response.response.rect.shrink(4.0);
                             let (sel_rows, sel_cols, sel_cell_w, sel_cell_h) =
                                 terminal_grid_and_cell_size(ui, &font_id, term_rect.size());
-                            // Mouse drag selection using raw pointer state
+                            // Mouse drag selection using raw pointer state (absolute coords)
                             let pointer_pos = ui.input(|i| i.pointer.hover_pos());
                             let primary_down = ui.input(|i| i.pointer.primary_down());
                             let primary_pressed = ui.input(|i| i.pointer.primary_pressed());
                             if let Some(pos) = pointer_pos {
-                                if term_rect.contains(pos) {
-                                    if primary_pressed {
-                                        let cell = pixel_to_grid_cell(pos, term_rect, sel_cell_w, sel_cell_h, sel_rows, sel_cols);
-                                        let sel = self.terminal_selections.entry(tab_id).or_default();
-                                        sel.anchor = Some(cell);
-                                        sel.end = Some(cell);
-                                    } else if primary_down {
-                                        let cell = pixel_to_grid_cell(pos, term_rect, sel_cell_w, sel_cell_h, sel_rows, sel_cols);
+                                let scroll_off = self.pty_sessions.get(&tab_id)
+                                    .map(|s| s.scroll_offset).unwrap_or(0);
+                                if primary_pressed && term_rect.contains(pos) {
+                                    let (row, col) = pixel_to_grid_cell(
+                                        pos, term_rect, sel_cell_w, sel_cell_h, sel_rows, sel_cols,
+                                    );
+                                    let abs = AbsPos {
+                                        abs_row: screen_row_to_abs(row, scroll_off, sel_rows),
+                                        col,
+                                    };
+                                    let sel = self.terminal_selections.entry(tab_id).or_default();
+                                    sel.anchor = Some(abs);
+                                    sel.end = Some(abs);
+                                } else if primary_down {
+                                    let has_anchor = self.terminal_selections
+                                        .get(&tab_id).is_some_and(|s| s.anchor.is_some());
+                                    if term_rect.contains(pos) {
+                                        let (row, col) = pixel_to_grid_cell(
+                                            pos, term_rect, sel_cell_w, sel_cell_h, sel_rows, sel_cols,
+                                        );
+                                        let abs = AbsPos {
+                                            abs_row: screen_row_to_abs(row, scroll_off, sel_rows),
+                                            col,
+                                        };
                                         if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
                                             if sel.anchor.is_some() {
-                                                sel.end = Some(cell);
+                                                sel.end = Some(abs);
+                                            }
+                                        }
+                                    } else if has_anchor {
+                                        // Auto-scroll: mouse dragged outside terminal rect
+                                        if pos.y < term_rect.top() {
+                                            // Mouse above terminal: scroll up into history
+                                            let new_off = {
+                                                if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                                                    session.scroll_offset = session.scroll_offset.saturating_add(1);
+                                                    Some(session.scroll_offset)
+                                                } else { None }
+                                            };
+                                            if let Some(off) = new_off {
+                                                if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                                                    sel.end = Some(AbsPos {
+                                                        abs_row: screen_row_to_abs(0, off, sel_rows),
+                                                        col: 0,
+                                                    });
+                                                }
+                                            }
+                                        } else if pos.y > term_rect.bottom() {
+                                            // Mouse below terminal: scroll down toward present
+                                            let new_off = {
+                                                if let Some(session) = self.pty_sessions.get_mut(&tab_id) {
+                                                    session.scroll_offset = session.scroll_offset.saturating_sub(1);
+                                                    Some(session.scroll_offset)
+                                                } else { None }
+                                            };
+                                            if let Some(off) = new_off {
+                                                if let Some(sel) = self.terminal_selections.get_mut(&tab_id) {
+                                                    sel.end = Some(AbsPos {
+                                                        abs_row: screen_row_to_abs(
+                                                            sel_rows.saturating_sub(1), off, sel_rows,
+                                                        ),
+                                                        col: sel_cols.saturating_sub(1),
+                                                    });
+                                                }
                                             }
                                         }
                                     }
@@ -2519,17 +2582,23 @@ mod gui {
                                     "terminal focus requested tab={tab_id}"
                                 ));
                             }
-                            // Draw selection highlight overlay
+                            // Draw selection highlight overlay (absolute → screen coords)
                             if let Some(sel) = self.terminal_selections.get(&tab_id) {
-                                if let Some(((sr, sc), (er, ec))) = sel.normalized() {
+                                if let Some((start, end)) = sel.normalized() {
+                                    let hl_scroll = self.pty_sessions.get(&tab_id)
+                                        .map(|s| s.scroll_offset).unwrap_or(0);
                                     let painter = ui.painter();
                                     let highlight = egui::Color32::from_rgba_unmultiplied(60, 120, 220, 100);
-                                    for r in sr..=er {
-                                        let col_start = if r == sr { sc } else { 0 };
-                                        let col_end = if r == er { ec } else { sel_cols.saturating_sub(1) };
-                                        let x0 = term_rect.left() + col_start as f32 * sel_cell_w;
-                                        let y0 = term_rect.top() + r as f32 * sel_cell_h;
-                                        let x1 = term_rect.left() + (col_end as f32 + 1.0) * sel_cell_w;
+                                    for screen_r in 0..sel_rows {
+                                        let abs_r = screen_row_to_abs(screen_r, hl_scroll, sel_rows);
+                                        if abs_r > start.abs_row || abs_r < end.abs_row {
+                                            continue;
+                                        }
+                                        let c0 = if abs_r == start.abs_row { start.col } else { 0 };
+                                        let c1 = if abs_r == end.abs_row { end.col } else { sel_cols.saturating_sub(1) };
+                                        let x0 = term_rect.left() + c0 as f32 * sel_cell_w;
+                                        let y0 = term_rect.top() + screen_r as f32 * sel_cell_h;
+                                        let x1 = term_rect.left() + (c1 as f32 + 1.0) * sel_cell_w;
                                         let y1 = y0 + sel_cell_h;
                                         painter.rect_filled(
                                             egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
@@ -3959,6 +4028,91 @@ mod gui {
         let col = (x / cell_w).floor().max(0.0) as u16;
         let row = (y / cell_h).floor().max(0.0) as u16;
         (row.min(rows.saturating_sub(1)), col.min(cols.saturating_sub(1)))
+    }
+
+    /// Convert a screen row to an absolute row (scroll-invariant).
+    /// abs_row 0 = newest line, increasing into history.
+    fn screen_row_to_abs(screen_row: u16, scroll_offset: usize, visible_rows: u16) -> usize {
+        scroll_offset + (visible_rows as usize) - 1 - (screen_row as usize)
+    }
+
+    /// Convert an absolute row back to a screen row, or None if outside the visible viewport.
+    #[cfg(test)]
+    fn abs_to_screen_row(abs_row: usize, scroll_offset: usize, visible_rows: u16) -> Option<u16> {
+        let top_abs = scroll_offset + (visible_rows as usize) - 1;
+        if abs_row > top_abs || abs_row < scroll_offset {
+            return None;
+        }
+        Some((top_abs - abs_row) as u16)
+    }
+
+    /// Extract selected text from a terminal parser across an absolute selection range.
+    /// `start` has the higher abs_row (further into history), `end` has the lower.
+    fn extract_selection_text(
+        parser: &mut vt100::Parser,
+        start: AbsPos,
+        end: AbsPos,
+    ) -> String {
+        let visible_rows = parser.screen().size().0;
+        let vr = visible_rows as usize;
+        let span = start.abs_row - end.abs_row + 1;
+
+        if span <= vr {
+            // Fast path: selection fits in one viewport
+            let sb = end.abs_row;
+            parser.screen_mut().set_scrollback(sb);
+            let screen_start = (vr - 1 - (start.abs_row - end.abs_row)) as u16;
+            let screen_end = visible_rows - 1;
+            let text = parser.screen().contents_between(
+                screen_start,
+                start.col,
+                screen_end,
+                end.col.saturating_add(1),
+            );
+            parser.screen_mut().set_scrollback(0);
+            return text;
+        }
+
+        // Slow path: multi-viewport selection — iterate in viewport-sized chunks
+        let cols = parser.screen().size().1;
+        let mut result = String::new();
+        let mut current_abs_top = start.abs_row;
+        let mut is_first = true;
+
+        loop {
+            let sb = current_abs_top.saturating_sub(vr - 1);
+            parser.screen_mut().set_scrollback(sb);
+
+            let screen_top = (sb + vr - 1 - current_abs_top) as u16;
+            let col_start = if is_first { start.col } else { 0 };
+
+            let viewport_bottom_abs = sb;
+            let (screen_bottom, col_end, done) = if end.abs_row >= viewport_bottom_abs {
+                let sr = (sb + vr - 1 - end.abs_row) as u16;
+                (sr, end.col.saturating_add(1), true)
+            } else {
+                (visible_rows - 1, cols, false)
+            };
+
+            let chunk = parser.screen().contents_between(
+                screen_top, col_start, screen_bottom, col_end,
+            );
+
+            if !result.is_empty() && !chunk.is_empty() {
+                result.push('\n');
+            }
+            result.push_str(&chunk);
+
+            if done || sb == 0 {
+                break;
+            }
+
+            current_abs_top = sb - 1;
+            is_first = false;
+        }
+
+        parser.screen_mut().set_scrollback(0);
+        result
     }
 
     fn resize_pty_session(session: &mut PtySession, rows: u16, cols: u16) {
@@ -5579,36 +5733,79 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
 
         #[test]
         fn terminal_selection_normalized_orders_correctly() {
+            // anchor at abs_row 2 (closer to present), end at abs_row 5 (further in history)
+            // normalized: start=higher abs_row (5), end=lower abs_row (2)
             let sel = TerminalSelection {
-                anchor: Some((5, 10)),
-                end: Some((2, 3)),
+                anchor: Some(AbsPos { abs_row: 2, col: 3 }),
+                end: Some(AbsPos { abs_row: 5, col: 10 }),
             };
-            let ((sr, sc), (er, ec)) = sel.normalized().unwrap();
-            assert_eq!((sr, sc), (2, 3));
-            assert_eq!((er, ec), (5, 10));
+            let (start, end) = sel.normalized().unwrap();
+            assert_eq!(start, AbsPos { abs_row: 5, col: 10 });
+            assert_eq!(end, AbsPos { abs_row: 2, col: 3 });
         }
 
         #[test]
         fn terminal_selection_normalized_same_row() {
             let sel = TerminalSelection {
-                anchor: Some((3, 20)),
-                end: Some((3, 5)),
+                anchor: Some(AbsPos { abs_row: 3, col: 20 }),
+                end: Some(AbsPos { abs_row: 3, col: 5 }),
             };
-            let ((sr, sc), (er, ec)) = sel.normalized().unwrap();
-            assert_eq!((sr, sc), (3, 5));
-            assert_eq!((er, ec), (3, 20));
+            let (start, end) = sel.normalized().unwrap();
+            assert_eq!(start, AbsPos { abs_row: 3, col: 5 });
+            assert_eq!(end, AbsPos { abs_row: 3, col: 20 });
         }
 
         #[test]
         fn terminal_selection_clear_removes_state() {
             let mut sel = TerminalSelection {
-                anchor: Some((1, 2)),
-                end: Some((3, 4)),
+                anchor: Some(AbsPos { abs_row: 1, col: 2 }),
+                end: Some(AbsPos { abs_row: 3, col: 4 }),
             };
             assert!(sel.is_active());
             sel.clear();
             assert!(!sel.is_active());
             assert!(sel.normalized().is_none());
+        }
+
+        #[test]
+        fn screen_row_to_abs_basic() {
+            // At scroll_offset 0, visible_rows 25:
+            // screen_row 0 (top) → abs_row 24, screen_row 24 (bottom) → abs_row 0
+            assert_eq!(screen_row_to_abs(0, 0, 25), 24);
+            assert_eq!(screen_row_to_abs(24, 0, 25), 0);
+            assert_eq!(screen_row_to_abs(12, 0, 25), 12);
+            // At scroll_offset 10:
+            // screen_row 0 → abs_row 34, screen_row 24 → abs_row 10
+            assert_eq!(screen_row_to_abs(0, 10, 25), 34);
+            assert_eq!(screen_row_to_abs(24, 10, 25), 10);
+        }
+
+        #[test]
+        fn abs_to_screen_row_basic() {
+            // At scroll_offset 0, visible_rows 25: visible abs_rows 0..=24
+            assert_eq!(abs_to_screen_row(24, 0, 25), Some(0));
+            assert_eq!(abs_to_screen_row(0, 0, 25), Some(24));
+            assert_eq!(abs_to_screen_row(12, 0, 25), Some(12));
+            // Outside visible range
+            assert_eq!(abs_to_screen_row(25, 0, 25), None);
+            // At scroll_offset 10: visible abs_rows 10..=34
+            assert_eq!(abs_to_screen_row(34, 10, 25), Some(0));
+            assert_eq!(abs_to_screen_row(10, 10, 25), Some(24));
+            assert_eq!(abs_to_screen_row(9, 10, 25), None);
+            assert_eq!(abs_to_screen_row(35, 10, 25), None);
+        }
+
+        #[test]
+        fn abs_to_screen_row_roundtrip() {
+            for offset in [0, 1, 5, 50, 100] {
+                for vr in [1, 10, 25, 80] {
+                    for sr in 0..vr {
+                        let abs = screen_row_to_abs(sr, offset, vr);
+                        let back = abs_to_screen_row(abs, offset, vr);
+                        assert_eq!(back, Some(sr), "roundtrip failed offset={offset} vr={vr} sr={sr}");
+                    }
+                }
+            }
         }
 
         #[test]
