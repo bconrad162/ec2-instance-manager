@@ -2494,9 +2494,10 @@ mod gui {
                                 terminal_focus_id,
                                 egui::Sense::click(),
                             );
-                            // Shrink by the outer frame's inner_margin(4) so highlight
-                            // and mouse mapping align with the actual text content area.
-                            let term_rect = terminal_response.response.rect.shrink(4.0);
+                            // Use the label's actual rendered rect so highlight and
+                            // mouse mapping align with text regardless of frame margins
+                            // or display-specific layout rounding.
+                            let term_rect = terminal_response.inner.rect;
                             let (sel_rows, sel_cols, sel_cell_w, sel_cell_h) =
                                 terminal_grid_and_cell_size(ui, &font_id, term_rect.size());
                             // Mouse drag selection using raw pointer state (absolute coords)
