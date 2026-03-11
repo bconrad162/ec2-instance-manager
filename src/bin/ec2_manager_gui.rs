@@ -2426,6 +2426,9 @@ mod gui {
                                                         terminal_grid_and_cell_size(
                                                             ui, &font_id, size,
                                                         );
+                                                    let norm_sel = self.terminal_selections
+                                                        .get(&tab_id)
+                                                        .and_then(|s| s.normalized());
                                                     let mut terminal_job =
                                                         if let Some(session) =
                                                             self.pty_sessions
@@ -2446,10 +2449,12 @@ mod gui {
                                                                 session.scroll_offset
                                                             };
                                                             let cursor_visible = show_cursor && effective_offset == 0;
+                                                            let layout_sel = norm_sel.map(|(s, e)| (s, e, effective_offset));
                                                             let job = terminal_layout_job(
                                                                 session.parser.screen(),
                                                                 cursor_visible,
                                                                 font_id.clone(),
+                                                                layout_sel,
                                                             );
                                                             if effective_offset > 0 {
                                                                 session.parser.screen_mut().set_scrollback(0);
@@ -2582,32 +2587,6 @@ mod gui {
                                 self.log_debug(format!(
                                     "terminal focus requested tab={tab_id}"
                                 ));
-                            }
-                            // Draw selection highlight overlay (absolute → screen coords)
-                            if let Some(sel) = self.terminal_selections.get(&tab_id) {
-                                if let Some((start, end)) = sel.normalized() {
-                                    let hl_scroll = self.pty_sessions.get(&tab_id)
-                                        .map(|s| s.scroll_offset).unwrap_or(0);
-                                    let painter = ui.painter();
-                                    let highlight = egui::Color32::from_rgba_unmultiplied(60, 120, 220, 100);
-                                    for screen_r in 0..sel_rows {
-                                        let abs_r = screen_row_to_abs(screen_r, hl_scroll, sel_rows);
-                                        if abs_r > start.abs_row || abs_r < end.abs_row {
-                                            continue;
-                                        }
-                                        let c0 = if abs_r == start.abs_row { start.col } else { 0 };
-                                        let c1 = if abs_r == end.abs_row { end.col } else { sel_cols.saturating_sub(1) };
-                                        let x0 = term_rect.left() + c0 as f32 * sel_cell_w;
-                                        let y0 = term_rect.top() + screen_r as f32 * sel_cell_h;
-                                        let x1 = term_rect.left() + (c1 as f32 + 1.0) * sel_cell_w;
-                                        let y1 = y0 + sel_cell_h;
-                                        painter.rect_filled(
-                                            egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
-                                            0.0,
-                                            highlight,
-                                        );
-                                    }
-                                }
                             }
                             if terminal_focus_response.secondary_clicked() {
                                 if let Ok(mut clipboard) = arboard::Clipboard::new() {
@@ -3907,14 +3886,19 @@ mod gui {
         egui::Color32::from_rgb(230, 230, 230)
     }
 
+    /// Build a LayoutJob for terminal content.  When `selection` is provided
+    /// (start, end, scroll_offset), selected cells get a highlight background
+    /// baked directly into the galley so it is pixel-perfect on every display.
     fn terminal_layout_job(
         screen: &vt100::Screen,
         show_cursor: bool,
         font_id: egui::FontId,
+        selection: Option<(AbsPos, AbsPos, usize)>,
     ) -> egui::text::LayoutJob {
         let (rows, cols) = screen.size();
         let default_fg = terminal_panel_text();
         let default_bg = terminal_panel_fill();
+        let highlight_bg = egui::Color32::from_rgba_unmultiplied(60, 120, 220, 180);
         let cursor = if show_cursor && !screen.hide_cursor() {
             Some(screen.cursor_position())
         } else {
@@ -3929,7 +3913,7 @@ mod gui {
         for row in 0..rows {
             for col in 0..cols {
                 let cursor_cell = cursor == Some((row, col));
-                let (cell_text, format) = if let Some(cell) = screen.cell(row, col) {
+                let (cell_text, mut format) = if let Some(cell) = screen.cell(row, col) {
                     let text = if cell.is_wide_continuation() {
                         " "
                     } else {
@@ -3957,6 +3941,18 @@ mod gui {
                     };
                     (" ", format)
                 };
+
+                // Apply selection highlight as cell background
+                if let Some((ref start, ref end, scroll_off)) = selection {
+                    let abs_r = screen_row_to_abs(row, scroll_off, rows);
+                    let in_sel = abs_r <= start.abs_row
+                        && abs_r >= end.abs_row
+                        && !(abs_r == start.abs_row && col < start.col)
+                        && !(abs_r == end.abs_row && col > end.col);
+                    if in_sel {
+                        format.background = highlight_bg;
+                    }
+                }
 
                 if current_format
                     .as_ref()
@@ -5503,6 +5499,7 @@ mod gui {
                 parser.screen(),
                 false,
                 egui::FontId::monospace(12.0),
+                None,
             );
             let mut found_red = false;
             for section in &job.sections {
@@ -5534,6 +5531,7 @@ mod gui {
                 parser.screen(),
                 false,
                 egui::FontId::monospace(12.0),
+                None,
             );
             assert!(job.text.contains("hello"));
         }
@@ -5706,6 +5704,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 parser.screen(),
                 false,
                 egui::FontId::monospace(12.0),
+                None,
             );
             // Scroll up to see earlier content
             parser.screen_mut().set_scrollback(5);
@@ -5713,6 +5712,7 @@ drwxr-xr-x 5 user user 4096 Jan 10 12:00 ..
                 parser.screen(),
                 false,
                 egui::FontId::monospace(12.0),
+                None,
             );
             parser.screen_mut().set_scrollback(0);
             // The scrolled view should differ from the bottom view
